@@ -141,8 +141,12 @@ def approval_messages(req: dict | None, snd: int, sq: int) -> list[dict]:
     parts = _chunks(detail, CHUNK_BYTES) or [""]
     header = {"so": 1, "ai": req["id"], "at": title, "ah": head, "an": len(parts),
               "snd": snd, "sq": sq}
+    if req.get("always"):           # the rule "Always" saves, e.g. "Bash(npm run lint:*)"
+        header["aa"] = ascii_only(req["always"], 60)
     while len(json.dumps(header, separators=(",", ":"))) > MAX_WRITE and header["ah"]:
         header["ah"] = header["ah"][:-1]
+    while len(json.dumps(header, separators=(",", ":"))) > MAX_WRITE and header.get("aa"):
+        header["aa"] = header["aa"][:-1]
     return [header] + [{"so": 1, "ac": req["id"], "d": p} for p in parts]
 
 

@@ -17,8 +17,16 @@ send the new messages gets the stock behavior.
   headed by Claude's own one-line description of the command, with the full
   command underneath in monospace. Commands up to 600 characters (multi-line
   included) scroll, and Allow unlocks only after you've scrolled to the end.
-  Longer ones, plans and questions, and anything while the board is face-down
-  or disconnected, fall through to Claude Code's normal prompt.
+  Long commands page through on their own. When Claude Code offers a
+  "don't ask again" rule, a third **Always** button saves that same rule.
+  Longer ones, plans and questions, prompts Claude Code reserves for the person
+  (such as the read fence's), and anything while the board is face-down or
+  disconnected, fall through to Claude Code's normal prompt. Each prompt's
+  outcome is logged to `%LOCALAPPDATA%\Clawdmeter\approval-hook.log`.
+- **Battery mode**: unplugged, the screen runs at 60% of your brightness and
+  sleeps after 2 minutes without a touch (on USB it never sleeps). Tap, a
+  button, picking it up, or Claude needing you wakes it; face-down goes dark
+  right away. Tunables are in `firmware/src/idle_cfg.h`.
 - **Attention screens + sounds**: "Claude needs you" when a permission prompt is
   waiting, "Your turn" after a long turn, a small celebration after a very long
   one. Sounds are synthesized on the ES8311 codec.
@@ -43,12 +51,12 @@ send the new messages gets the stock behavior.
 |---|---|---|
 | usage | (none) | `s sr w wr st acct tp pd rd ok` + `sl sd td op` (spend), `vol fz` (settings), `t tf c` |
 | status | `"so":1` | `cs a tt pj ns att aq atd atp snd sq` (partial: only keys present change) |
-| approval | `"so":1` + `ai` | header `ai at ah an snd sq`, then `an` chunks `{"so":1,"ac":id,"d":...}` in order (`ai:0` clears) |
+| approval | `"so":1` + `ai` | header `ai at ah aa an snd sq` (`aa` = rule Always saves), then `an` chunks `{"so":1,"ac":id,"d":...}` in order (`ai:0` clears) |
 | stats | `"hs":1` | `dh di dm kt kf kp ka km kr` |
 | max | `"hm":1` | `s sr w wr e` (+ optional `m mr mn` per-model weekly limit); `e`: 0 ok, 1 not signed in, 2 sign-in expired |
 
-Board -> host, on the REQ notify characteristic: `0x01` refresh, `A<id>:1|0`
-approval answer, `D1`/`D0` face-down, `V<n>` volume changed.
+Board -> host, on the REQ notify characteristic: `0x01` refresh, `A<id>:1|0|2`
+approval answer (2 = always), `D1`/`D0` face-down, `V<n>` volume changed.
 
 ## Windows daemon
 

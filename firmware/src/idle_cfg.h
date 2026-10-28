@@ -21,3 +21,11 @@
 // fully ignored during sleep — useful if cats/sleeves brushing the panel
 // overnight would be a problem.
 #define IDLE_WAKE_ON_TOUCH          true
+
+// ---- Battery mode (no USB power) ----
+// Unplugged, the screen dims and sleeps much sooner. It wakes for a tap, a
+// button, picking it up or a shake, and on its own when Claude needs you, a
+// turn finishes, or an approval comes in. Face-down on battery goes dark at once.
+#define IDLE_BATTERY_TIMEOUT_MS     (2UL * 60UL * 1000UL)   // 2 min without a touch
+#define IDLE_BATTERY_BRIGHTNESS_PCT 60                      // of the user's level
+#define IDLE_ASLEEP_LOOP_MS         25                      // loop pace while dark (vs 5 ms)

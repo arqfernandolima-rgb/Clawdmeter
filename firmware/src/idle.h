@@ -20,3 +20,8 @@ bool idle_consume_wake_press(void);
 // sleeves, etc.). Callers use this to silently drop touch events while the
 // panel is dark.
 bool idle_is_asleep(void);
+
+// Battery mode: true when running on battery (no USB power, board has a battery).
+bool idle_on_battery(void);
+// Fade to dark right away (e.g. face-down on battery). Any wake trigger brings it back.
+void idle_sleep_now(void);

@@ -464,13 +464,15 @@ void ble_request_refresh(void) {
     }
 }
 
-void ble_send_approval(uint32_t id, bool allow) {
+void ble_send_approval(uint32_t id, bool allow, bool always) {
     if (state == BLE_STATE_CONNECTED && req_char) {
         char msg[24];
-        int n = snprintf(msg, sizeof(msg), "A%lu:%d", (unsigned long)id, allow ? 1 : 0);
+        int code = allow ? (always ? 2 : 1) : 0;    // 0 deny, 1 allow, 2 always allow
+        int n = snprintf(msg, sizeof(msg), "A%lu:%d", (unsigned long)id, code);
         req_char->setValue((const uint8_t*)msg, (size_t)n);
         req_char->notify();
-        Serial.printf("BLE: approval %lu -> %s\n", (unsigned long)id, allow ? "allow" : "deny");
+        Serial.printf("BLE: approval %lu -> %s\n", (unsigned long)id,
+                      code == 2 ? "always" : code ? "allow" : "deny");
     }
 }
 

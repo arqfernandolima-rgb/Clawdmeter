@@ -132,11 +132,47 @@ def write_json(p: Path, data: dict) -> None:
     os.replace(tmp, p)
 
 
-def decision(behavior: str) -> str:
+def decision(behavior: str, rules: list | None = None) -> str:
     d = {"behavior": behavior}
     if behavior == "deny":
         d["message"] = "Denied on the Clawdmeter"
+    if behavior == "allow" and rules:
+        d["updatedPermissions"] = rules      # "Always": the same rule the terminal would save
     return json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": d}})
+
+
+def always_rules(evt: dict) -> tuple[list, str]:
+    """Claude Code's own "don't ask again" suggestions, limited to allow rules.
+
+    Returns (updatedPermissions entries, rule text for the board). Empty when
+    Claude Code offers none (then the board shows no Always button).
+    """
+    keep, names = [], []
+    for s in evt.get("permission_suggestions") or []:
+        if not isinstance(s, dict) or s.get("type") != "addRules" or s.get("behavior") != "allow":
+            continue
+        rules = [r for r in s.get("rules") or [] if isinstance(r, dict) and r.get("toolName")]
+        if not rules:
+            continue
+        keep.append({**s, "rules": rules})
+        for r in rules:
+            rc = r.get("ruleContent")
+            names.append(f"{r['toolName']}({rc})" if rc else str(r["toolName"]))
+    return keep, ", ".join(names)
+
+
+LOG = ROOT / "approval-hook.log"
+
+
+def note(msg: str) -> None:
+    """One line per prompt (what happened, never the command text), for diagnosis."""
+    try:
+        if LOG.exists() and LOG.stat().st_size > 200_000:
+            LOG.write_text("", encoding="utf-8")
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -144,31 +180,39 @@ def main() -> None:
         return
     if os.environ.get("CLAWDMETER_KEEPALIVE"):
         return                                   # the daemon's own token keep-alive
+    evt = json.loads(sys.stdin.read() or "{}")
+    tool = str(evt.get("tool_name", ""))
     try:
         timeout = max(3.0, min(120.0, float(config_value("approval_timeout_s", "20"))))
     except ValueError:
         timeout = 20.0
     if file_age(ALIVE) > ALIVE_MAX_AGE:
-        return                                   # board not connected right now
+        note(f"{tool}: board not connected -> keyboard")
+        return
     try:
         if (ROOT / "dnd").read_text(encoding="utf-8").strip() == "1":
-            return                               # board is face-down: answer at the keyboard
+            note(f"{tool}: board face-down -> keyboard")
+            return
     except OSError:
         pass
-    evt = json.loads(sys.stdin.read() or "{}")
-    summary = summarize(str(evt.get("tool_name", "")), evt.get("tool_input") or {})
+    summary = summarize(tool, evt.get("tool_input") or {})
     if not summary:
+        n = len(str((evt.get("tool_input") or {}).get("command", "")))
+        note(f"{tool}: doesn't fit the board ({n} chars) -> keyboard")
         return
     if file_age(REQ) < timeout + 10:
-        return                                   # another session is already asking
+        note(f"{tool}: another prompt is already on the board -> keyboard")
+        return
     title, head, detail = summary
+    rules, rule_text = always_rules(evt)
     req_id = int(time.time() * 1000) % 1_000_000_000 or 1
     try:
         RESP.unlink()
     except OSError:
         pass
-    write_json(REQ, {"id": req_id, "title": title, "head": head, "detail": detail, "ts": time.time()})
-    answer = None
+    write_json(REQ, {"id": req_id, "title": title, "head": head, "detail": detail,
+                     "always": rule_text if rules else "", "ts": time.time()})
+    answer, always = None, False
     try:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -176,6 +220,7 @@ def main() -> None:
                 r = json.loads(RESP.read_text(encoding="utf-8"))
                 if int(r.get("id", -1)) == req_id:
                     answer = bool(r.get("allow"))
+                    always = answer and bool(r.get("always")) and bool(rules)
                     break
             except (OSError, ValueError):
                 pass
@@ -186,9 +231,12 @@ def main() -> None:
                 REQ.unlink()
         except (OSError, ValueError):
             pass
-    if answer is not None:
-        sys.stdout.write(decision("allow" if answer else "deny"))
-        sys.stdout.flush()
+    if answer is None:
+        note(f"{tool}: shown on the board, no tap in {timeout:.0f} s -> keyboard")
+        return
+    note(f"{tool}: {'always allowed' if always else 'allowed' if answer else 'denied'} on the board")
+    sys.stdout.write(decision("allow" if answer else "deny", rules if always else None))
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

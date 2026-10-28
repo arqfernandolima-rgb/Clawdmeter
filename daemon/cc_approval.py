@@ -26,7 +26,8 @@ def current_request() -> dict | None:
         if rid <= 0:
             return None
         return {"id": rid, "title": str(r.get("title", ""))[:30],
-                "head": str(r.get("head", ""))[:100], "detail": str(r.get("detail", ""))[:640]}
+                "head": str(r.get("head", ""))[:100], "detail": str(r.get("detail", ""))[:640],
+                "always": str(r.get("always", ""))[:80]}   # rule text when "Always" is offered
     except (OSError, ValueError, TypeError):
         return None
 
@@ -89,22 +90,25 @@ def approvals_today() -> int:
         return 0
 
 
-def parse_answer(data: bytes) -> tuple[int, bool] | None:
-    """Board notify "A<id>:1" / "A<id>:0" -> (id, allow); anything else -> None."""
+def parse_answer(data: bytes) -> tuple[int, bool, bool] | None:
+    """Board notify "A<id>:1" allow / "A<id>:0" deny / "A<id>:2" always allow
+    -> (id, allow, always); anything else -> None."""
     try:
         s = bytes(data).decode("ascii", "replace")
         if not s.startswith("A") or ":" not in s:
             return None
         rid, flag = s[1:].split(":", 1)
-        return int(rid), flag.strip().startswith("1")
+        flag = flag.strip()[:1]
+        return int(rid), flag in ("1", "2"), flag == "2"
     except (ValueError, TypeError):
         return None
 
 
-def write_answer(rid: int, allow: bool) -> None:
+def write_answer(rid: int, allow: bool, always: bool = False) -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
     tmp = RESP.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"id": rid, "allow": allow, "ts": time.time()}), encoding="utf-8")
+    tmp.write_text(json.dumps({"id": rid, "allow": allow, "always": always and allow,
+                               "ts": time.time()}), encoding="utf-8")
     os.replace(tmp, RESP)
 
 

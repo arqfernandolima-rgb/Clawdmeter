@@ -166,6 +166,7 @@ static void parse_status_keys(JsonDocument& doc, UsageData* out) {
         out->ap_id = doc["ai"] | 0u;
         strlcpy(out->ap_title, doc["at"] | "", sizeof(out->ap_title));
         strlcpy(out->ap_head, doc["ah"] | "", sizeof(out->ap_head));
+        strlcpy(out->ap_always, doc["aa"] | "", sizeof(out->ap_always));
         strlcpy(out->ap_detail, doc["ad"] | "", sizeof(out->ap_detail));
         out->ap_parts = doc["an"] | 0;
         out->ap_got = 0;
@@ -427,7 +428,7 @@ void loop() {
     power_hal_tick();
     imu_hal_tick();
     sound_hal_tick();
-    splash_tick();
+    if (!idle_is_asleep()) splash_tick();   // nothing to animate on a dark panel
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
     // is detected by the next tick after wake and ramped in then.
@@ -440,6 +441,7 @@ void loop() {
         ble_send_dnd(d);                       // host routes approvals to the keyboard
         Serial.printf("motion: %s\n", d ? "face-down, quiet" : "face-up again");
         if (!d) { idle_note_activity(); sound_hal_play(CHIME_BLIP); }
+        else if (idle_on_battery()) idle_sleep_now();   // nobody can see it: save the battery
     }
     if (motion_take_shake()) {
         idle_note_activity();
@@ -639,5 +641,6 @@ void loop() {
         }
     }
 
-    delay(5);
+    // Slower pace while the panel is dark (touch still wakes it within ~25 ms).
+    delay(idle_is_asleep() ? IDLE_ASLEEP_LOOP_MS : 5);
 }

@@ -450,13 +450,13 @@ class Session:
 
     def _on_refresh(self, _char, data: bytearray) -> None:
         # The same notify characteristic also carries approval answers from the
-        # board's touchscreen: "A<id>:1" (allow) / "A<id>:0" (deny).
+        # board's touchscreen: "A<id>:1" (allow) / "A<id>:0" (deny) / "A<id>:2" (always).
         answer = cc_approval.parse_answer(data)
         if answer is not None:
-            rid, allow = answer
-            log(f"Approval {rid}: {'allow' if allow else 'deny'} (from the board)")
+            rid, allow, always = answer
+            log(f"Approval {rid}: {'always allow' if always else 'allow' if allow else 'deny'} (from the board)")
             try:
-                cc_approval.write_answer(rid, allow)
+                cc_approval.write_answer(rid, allow, always)
                 cc_approval.count_approval()
             except OSError as e:
                 log(f"Couldn't write approval answer: {e}")

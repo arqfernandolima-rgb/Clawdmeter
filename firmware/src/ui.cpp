@@ -690,27 +690,54 @@ static lv_obj_t* ap_title = nullptr;    // Claude's description, or the action i
 static lv_obj_t* ap_panel = nullptr;    // scrolls when the command is long
 static lv_obj_t* ap_detail = nullptr;
 static lv_obj_t* ap_hint = nullptr;
-static lv_obj_t* ap_allow_btn = nullptr;
-static lv_obj_t* ap_allow_lbl = nullptr;
+static lv_obj_t* ap_btn[3] = {nullptr, nullptr, nullptr};   // deny, allow, always
+static lv_obj_t* ap_btn_lbl[3] = {nullptr, nullptr, nullptr};
 static bool      ap_locked = false;     // Allow waits until the whole command was on screen
+static bool      ap_has_always = false; // Claude Code offered a "don't ask again" rule
+static char      ap_rule_hint[96] = "";
 static int       ap_hint_y = 0;
+static int       ap_btn_y = 0, ap_btn_h = 0;
+enum { AP_DENY = 0, AP_ALLOW = 1, AP_ALWAYS = 2 };
 static uint32_t  ap_shown_id = 0;      // request currently on screen
 static uint32_t  ap_answered_id = 0;   // answered here; ignore until the host clears it
 static bool      ap_visible = false;
 static bool      att_visible = false;       // attention screen (defined further down)
 static screen_t  ap_prev_screen = SCREEN_USAGE;
 
-static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
-                                const char* text, lv_color_t bg, lv_color_t fg, bool allow);
+static lv_obj_t* make_ap_button(lv_obj_t* parent, const char* text, lv_color_t bg, int code);
 
 static void ap_set_locked(bool locked) {
     ap_locked = locked;
-    if (!ap_allow_btn) return;
-    lv_obj_set_style_bg_color(ap_allow_btn, locked ? COL_BAR_BG : COL_GREEN, 0);
-    lv_obj_set_style_text_color(ap_allow_lbl, locked ? COL_DIM : COL_TEXT, 0);
-    lv_label_set_text(ap_hint, locked ? "Showing the rest - tap it to skip ahead" : "or answer at your keyboard");
+    if (!ap_btn[AP_ALLOW]) return;
+    lv_obj_set_style_bg_color(ap_btn[AP_ALLOW], locked ? COL_BAR_BG : COL_GREEN, 0);
+    lv_obj_set_style_text_color(ap_btn_lbl[AP_ALLOW], locked ? COL_DIM : COL_TEXT, 0);
+    lv_obj_set_style_bg_color(ap_btn[AP_ALWAYS], locked ? COL_BAR_BG : COL_ACCENT, 0);
+    lv_obj_set_style_text_color(ap_btn_lbl[AP_ALWAYS], locked ? COL_DIM : COL_TEXT, 0);
+    const char* hint = locked ? "Showing the rest - tap it to skip ahead"
+                     : ap_has_always ? ap_rule_hint : "or answer at your keyboard";
+    lv_label_set_text(ap_hint, hint);
     lv_obj_set_style_text_color(ap_hint, locked ? COL_AMBER : COL_DIM, 0);
     lv_obj_align(ap_hint, LV_ALIGN_TOP_MID, 0, ap_hint_y);
+}
+
+// Two big buttons (Deny | Allow), or three smaller ones (Deny | Always | Allow)
+// when Claude Code offers a "don't ask again" rule for this request.
+static void ap_layout_buttons(bool three) {
+    const int gap = L.small_icons ? 8 : 16;
+    const int n = three ? 3 : 2;
+    const int w = (L.content_w - (n - 1) * gap) / n;
+    const int order[3] = {AP_DENY, AP_ALWAYS, AP_ALLOW};
+    int x = L.margin;
+    for (int i = 0; i < 3; i++) {
+        int b = order[i];
+        if (b == AP_ALWAYS && !three) { lv_obj_add_flag(ap_btn[b], LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_obj_clear_flag(ap_btn[b], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(ap_btn[b], x, ap_btn_y);
+        lv_obj_set_size(ap_btn[b], w, ap_btn_h);
+        lv_obj_set_style_text_font(ap_btn_lbl[b], three ? L.reset_font : L.pct_font, 0);
+        lv_obj_center(ap_btn_lbl[b]);
+        x += w + gap;
+    }
 }
 
 // Long commands page through on their own: a screenful at a time, as instant
@@ -751,40 +778,38 @@ static void ap_scroll_cb(lv_event_t* e) {
 }
 
 static void ap_button_cb(lv_event_t* e) {
-    bool allow = (bool)(uintptr_t)lv_event_get_user_data(e);
+    int code = (int)(uintptr_t)lv_event_get_user_data(e);
     if (!ap_visible || ap_shown_id == 0) return;
-    if (allow && ap_locked) return;      // read it all first
-    ble_send_approval(ap_shown_id, allow);
+    if (code != AP_DENY && ap_locked) return;      // read it all first
+    if (code == AP_ALWAYS && !ap_has_always) return;
+    ble_send_approval(ap_shown_id, code != AP_DENY, code == AP_ALWAYS);
     ap_answered_id = ap_shown_id;
-    strlcpy(s_cc_status, allow ? "Allowed" : "Denied", sizeof(s_cc_status));
+    strlcpy(s_cc_status, code == AP_ALWAYS ? "Always allowed" : code ? "Allowed" : "Denied",
+            sizeof(s_cc_status));
     approval_hide();
 }
 
-static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
-                                const char* text, lv_color_t bg, lv_color_t fg, bool allow) {
+static lv_obj_t* make_ap_button(lv_obj_t* parent, const char* text, lv_color_t bg, int code) {
     lv_obj_t* b = lv_obj_create(parent);
-    lv_obj_set_pos(b, x, y);
-    lv_obj_set_size(b, w, h);
     lv_obj_set_style_bg_color(b, bg, 0);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_opa(b, LV_OPA_70, LV_STATE_PRESSED);
     lv_obj_set_style_radius(b, 12, 0);
     lv_obj_set_style_border_width(b, 0, 0);
     lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(b, ap_button_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)allow);
+    lv_obj_add_event_cb(b, ap_button_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)code);
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, text);
     lv_obj_set_style_text_font(l, L.pct_font, 0);
-    lv_obj_set_style_text_color(l, fg, 0);
+    lv_obj_set_style_text_color(l, COL_TEXT, 0);
     lv_obj_center(l);
-    if (allow) { ap_allow_btn = b; ap_allow_lbl = l; }
+    ap_btn[code] = b;
+    ap_btn_lbl[code] = l;
     return b;
 }
 
 static void build_approval(lv_obj_t* parent) {
-    const int gap = L.small_icons ? 8 : 16;
     const int btn_h = L.small_icons ? 50 : 100;
-    const int btn_w = (L.content_w - gap) / 2;
     const int btn_y = L.scr_h - L.margin - btn_h;
     const int top = L.small_icons ? 6 : L.title_y + 6;
     const int title_y = top + (L.small_icons ? 18 : 32);
@@ -846,10 +871,17 @@ static void build_approval(lv_obj_t* parent) {
     lv_label_set_text(ap_hint, "or answer at your keyboard");
     lv_obj_set_style_text_font(ap_hint, L.pace_font, 0);
     lv_obj_set_style_text_color(ap_hint, COL_DIM, 0);
+    lv_obj_set_style_text_align(ap_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(ap_hint, LV_LABEL_LONG_DOT);     // long "Always" rules end in "..."
+    lv_obj_set_width(ap_hint, L.content_w);
     lv_obj_align(ap_hint, LV_ALIGN_TOP_MID, 0, ap_hint_y);
 
-    make_ap_button(ap_box, L.margin, btn_y, btn_w, btn_h, "Deny", COL_PANEL, COL_TEXT, false);
-    make_ap_button(ap_box, L.margin + btn_w + gap, btn_y, btn_w, btn_h, "Allow", COL_GREEN, COL_TEXT, true);
+    ap_btn_y = btn_y;
+    ap_btn_h = btn_h;
+    make_ap_button(ap_box, "Deny", COL_PANEL, AP_DENY);
+    make_ap_button(ap_box, "Allow", COL_GREEN, AP_ALLOW);
+    make_ap_button(ap_box, "Always", COL_ACCENT, AP_ALWAYS);
+    ap_layout_buttons(false);
 
     lv_obj_add_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
 }
@@ -888,6 +920,9 @@ static void approval_update(const UsageData* data) {
     }
     lv_obj_align(ap_kicker, LV_ALIGN_TOP_MID, 0, L.small_icons ? 6 : L.title_y + 6);
     lv_label_set_text(ap_detail, data->ap_detail);
+    ap_has_always = data->ap_always[0] != 0;
+    snprintf(ap_rule_hint, sizeof(ap_rule_hint), "Always = don't ask again: %s", data->ap_always);
+    ap_layout_buttons(ap_has_always);
     ap_shown_id = data->ap_id;
     if (!ap_visible) ap_prev_screen = current_screen;
     if (current_screen != SCREEN_USAGE) ui_show_screen(SCREEN_USAGE);

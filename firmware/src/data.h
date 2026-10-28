@@ -24,6 +24,7 @@ struct UsageData {
     uint32_t ap_id;          // pending Claude Code approval request id (0 = none)
     char ap_title[32];       // e.g. "Run a command"
     char ap_head[100];       // Claude's one-line description ("" = none), the headline
+    char ap_always[64];      // rule "Always" would save, e.g. "Bash(npm test:*)" ("" = not offered)
     char ap_detail[640];     // the full command / path / URL (scrolls on screen)
     uint8_t ap_parts;        // detail chunks the host announced (0 = sent inline as "ad")
     uint8_t ap_got;          // chunks received so far; the prompt shows when complete
