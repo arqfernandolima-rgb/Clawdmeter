@@ -708,14 +708,46 @@ static void ap_set_locked(bool locked) {
     if (!ap_allow_btn) return;
     lv_obj_set_style_bg_color(ap_allow_btn, locked ? COL_BAR_BG : COL_GREEN, 0);
     lv_obj_set_style_text_color(ap_allow_lbl, locked ? COL_DIM : COL_TEXT, 0);
-    lv_label_set_text(ap_hint, locked ? "Scroll to the end to allow" : "or answer at your keyboard");
+    lv_label_set_text(ap_hint, locked ? "Showing the rest - tap it to skip ahead" : "or answer at your keyboard");
     lv_obj_set_style_text_color(ap_hint, locked ? COL_AMBER : COL_DIM, 0);
     lv_obj_align(ap_hint, LV_ALIGN_TOP_MID, 0, ap_hint_y);
 }
 
+// Long commands page through on their own: a screenful at a time, as instant
+// jumps (smooth scrolling repaints every frame, which the C6 can't keep up
+// with). Allow unlocks once the last page is on screen. A tap on the command
+// skips to the next page right away; dragging still works too.
+#define AP_PAGE_MS 1400
+static lv_timer_t* ap_page_timer = nullptr;
+
+static void ap_page_stop(void) {
+    if (ap_page_timer) { lv_timer_delete(ap_page_timer); ap_page_timer = nullptr; }
+}
+
+static void ap_page_step(void) {
+    if (!ap_panel) return;
+    int32_t bottom = lv_obj_get_scroll_bottom(ap_panel);
+    if (bottom <= 4) { ap_page_stop(); ap_set_locked(false); return; }
+    // keep two lines of overlap so you don't lose your place between pages
+    int32_t page = lv_obj_get_content_height(ap_panel) - 2 * (lv_font_get_line_height(&font_mono_18) + 3);
+    if (page < 40) page = 40;
+    int32_t dy = bottom < page ? bottom : page;
+    lv_obj_scroll_to_y(ap_panel, lv_obj_get_scroll_y(ap_panel) + dy, LV_ANIM_OFF);
+    if (lv_obj_get_scroll_bottom(ap_panel) <= 4) { ap_page_stop(); ap_set_locked(false); }
+}
+
+static void ap_page_timer_cb(lv_timer_t* t) { (void)t; ap_page_step(); }
+
+static void ap_panel_click_cb(lv_event_t* e) {
+    (void)e;
+    if (!ap_locked) return;
+    ap_page_step();
+    if (ap_page_timer) lv_timer_reset(ap_page_timer);
+}
+
 static void ap_scroll_cb(lv_event_t* e) {
     (void)e;
-    if (ap_locked && lv_obj_get_scroll_bottom(ap_panel) <= 4) ap_set_locked(false);
+    if (ap_locked && lv_obj_get_scroll_bottom(ap_panel) <= 4) { ap_page_stop(); ap_set_locked(false); }
 }
 
 static void ap_button_cb(lv_event_t* e) {
@@ -795,8 +827,11 @@ static void build_approval(lv_obj_t* parent) {
     lv_obj_set_style_bg_color(ap_panel, COL_DIM, LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(ap_panel, LV_OPA_70, LV_PART_SCROLLBAR);
     lv_obj_set_style_width(ap_panel, 4, LV_PART_SCROLLBAR);
+    lv_obj_clear_flag(ap_panel, LV_OBJ_FLAG_SCROLL_ELASTIC);   // fewer repaints when dragged
+    lv_obj_clear_flag(ap_panel, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_add_event_cb(ap_panel, ap_scroll_cb, LV_EVENT_SCROLL, NULL);
     lv_obj_add_event_cb(ap_panel, ap_scroll_cb, LV_EVENT_SCROLL_END, NULL);
+    lv_obj_add_event_cb(ap_panel, ap_panel_click_cb, LV_EVENT_CLICKED, NULL);
     ap_detail = lv_label_create(ap_panel);
     lv_label_set_text(ap_detail, "");
     lv_obj_set_style_text_font(ap_detail, &font_mono_18, 0);
@@ -821,6 +856,7 @@ static void build_approval(lv_obj_t* parent) {
 
 static void approval_hide(void) {
     if (!ap_box || !ap_visible) return;
+    ap_page_stop();
     lv_obj_add_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
     ap_visible = false;
     ap_shown_id = 0;
@@ -861,7 +897,9 @@ static void approval_update(const UsageData* data) {
     // Long command? Start at the top and keep Allow locked until the end was shown.
     lv_obj_scroll_to_y(ap_panel, 0, LV_ANIM_OFF);
     lv_obj_update_layout(ap_box);
+    ap_page_stop();
     ap_set_locked(lv_obj_get_scroll_bottom(ap_panel) > 4);
+    if (ap_locked) ap_page_timer = lv_timer_create(ap_page_timer_cb, AP_PAGE_MS, NULL);
     idle_note_activity();                // wake the panel for it
     Serial.printf("approval: showing %lu (%s)\n", (unsigned long)ap_shown_id, data->ap_title);
 }
