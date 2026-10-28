@@ -27,7 +27,10 @@ RESP = ROOT / "approval_resp.json"
 ALIVE = ROOT / "daemon_alive"
 CONFIG = ROOT / "config"
 
-MAX_DETAIL = 90        # characters that fit the board's detail box (~3 lines)
+MAX_DETAIL = 200       # one-line details (paths, URLs, queries); longer -> keyboard
+MAX_CMD = 600          # shell commands, multi-line OK: the board scrolls, and Allow
+                       # unlocks only after scrolling to the end. Longer -> keyboard
+MAX_HEAD = 90          # Claude's one-line description of the command (the headline)
 MAX_TITLE = 16         # characters that fit one line of the big title
 ALIVE_MAX_AGE = 6.0    # daemon heartbeat is written every ~2 s while connected
 
@@ -59,11 +62,30 @@ def one_line(s: str) -> str | None:
     return s
 
 
-def summarize(tool: str, ti: dict) -> tuple[str, str] | None:
-    """(title, detail) for the board, or None when it shouldn't go to the board."""
+def command_text(s: str) -> str | None:
+    """A shell command as the board shows it (all of it), or None if too long."""
+    s = str(s).replace("\r\n", "\n").replace("\r", "\n").replace("\t", "  ").strip()
+    if not s or len(s) > MAX_CMD:
+        return None
+    return s
+
+
+def headline(s: str) -> str:
+    s = " ".join(str(s or "").split())
+    return s if len(s) <= MAX_HEAD else s[:MAX_HEAD - 3].rstrip() + "..."
+
+
+def summarize(tool: str, ti: dict) -> tuple[str, str, str] | None:
+    """(title, headline, detail) for the board, or None when it shouldn't go there."""
     if tool in ("Bash", "PowerShell"):
-        d = one_line(ti.get("command", ""))
-        return ("Run a command", d) if d else None
+        d = command_text(ti.get("command", ""))
+        return ("Run a command", headline(ti.get("description", "")), d) if d else None
+    s = summarize_other(tool, ti)
+    return (s[0], "", s[1]) if s else None
+
+
+def summarize_other(tool: str, ti: dict) -> tuple[str, str] | None:
+    """(title, detail) for everything that isn't a shell command."""
     if tool in ("Edit", "MultiEdit", "NotebookEdit"):
         p = ti.get("file_path") or ti.get("notebook_path")
         return ("Edit a file", short_path(p)) if p else None
@@ -139,13 +161,13 @@ def main() -> None:
         return
     if file_age(REQ) < timeout + 10:
         return                                   # another session is already asking
-    title, detail = summary
+    title, head, detail = summary
     req_id = int(time.time() * 1000) % 1_000_000_000 or 1
     try:
         RESP.unlink()
     except OSError:
         pass
-    write_json(REQ, {"id": req_id, "title": title, "detail": detail, "ts": time.time()})
+    write_json(REQ, {"id": req_id, "title": title, "head": head, "detail": detail, "ts": time.time()})
     answer = None
     try:
         deadline = time.time() + timeout

@@ -12,7 +12,12 @@
 #define TX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000003"  // device ack/nack notifies
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
 
-#define BLE_BUF_SIZE 512
+// Host writes are queued: the daemon sends bursts (an approval header plus its
+// detail chunks, status, stats) faster than one loop pass, and a single buffer
+// would keep only the last one. Each write fits the ATT MTU (~244 bytes).
+#define RX_SLOT  320
+#define RX_SLOTS 8
+struct RxMsg { char data[RX_SLOT]; };
 
 // HID keyboard report descriptor (standard 6-KRO boot-protocol-compatible).
 // Includes the LED output report (Num/Caps/Scroll Lock indicators) — without
@@ -72,8 +77,8 @@ static const uint16_t DESIRED_TIMEOUT   = 600;   // ×10ms = 6s, matches PPCP
 static volatile uint16_t param_fix_handle = CONN_HANDLE_NONE;  // pending retry
 static volatile uint32_t param_fix_at_ms  = 0;                 // when to send it
 static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // one per connection
-static char rx_buf[BLE_BUF_SIZE];
-static volatile bool data_ready = false;
+static QueueHandle_t rx_q = nullptr;     // RxMsg, filled by the NimBLE host task
+static RxMsg rx_cur;                      // the message handed to the loop
 static volatile bool has_received_data = false;
 static char mac_str[18];
 
@@ -278,10 +283,19 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
             return;
         }
         std::string val = chr->getValue();
-        size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
-        memcpy(rx_buf, val.c_str(), len);
-        rx_buf[len] = '\0';
-        data_ready = true;
+        if (!rx_q) rx_q = xQueueCreate(RX_SLOTS, sizeof(RxMsg));
+        if (!rx_q) return;
+        static RxMsg m;                    // host-task only; copied into the queue
+        size_t len = std::min(val.length(), (size_t)(RX_SLOT - 1));
+        if (val.length() >= RX_SLOT) Serial.printf("BLE: RX write truncated (%u bytes)\n", (unsigned)val.length());
+        memcpy(m.data, val.c_str(), len);
+        m.data[len] = '\0';
+        if (xQueueSend(rx_q, &m, 0) != pdTRUE) {   // full: drop the oldest, keep the newest
+            RxMsg drop;
+            xQueueReceive(rx_q, &drop, 0);
+            xQueueSend(rx_q, &m, 0);
+            Serial.println("BLE: RX queue full, dropped oldest");
+        }
         has_received_data = true;
     }
 };
@@ -299,6 +313,7 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 void ble_init(void) {
+    if (!rx_q) rx_q = xQueueCreate(RX_SLOTS, sizeof(RxMsg));
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, no MITM, SC
 
@@ -410,12 +425,14 @@ bool ble_has_bonds(void) {
 }
 
 bool ble_has_data(void) {
-    return data_ready;
+    return rx_q && uxQueueMessagesWaiting(rx_q) > 0;
 }
 
+// Pops the oldest queued write. Call only after ble_has_data() returned true;
+// the pointer stays valid until the next call.
 const char* ble_get_data(void) {
-    data_ready = false;
-    return rx_buf;
+    if (!rx_q || xQueueReceive(rx_q, &rx_cur, 0) != pdTRUE) rx_cur.data[0] = '\0';
+    return rx_cur.data;
 }
 
 void ble_send_ack(void) {

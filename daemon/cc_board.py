@@ -107,15 +107,43 @@ def add_usage_extras(payload: dict, cfg: dict) -> None:
     payload["fz"] = cfg["facedown_sign"]
 
 
-def approval_message(req: dict | None, snd: int, sq: int) -> dict:
+CHUNK_BYTES = 170   # JSON-escaped detail per BLE write (each write stays < ~244 bytes)
+MAX_WRITE = 240
+
+
+def _chunks(text: str, limit: int) -> list[str]:
+    """Split so each piece's JSON-escaped form is at most `limit` bytes."""
+    out, cur, size = [], [], 0
+    for ch in text:
+        n = len(json.dumps(ch)) - 2
+        if size + n > limit and cur:
+            out.append("".join(cur))
+            cur, size = [], 0
+        cur.append(ch)
+        size += n
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def approval_messages(req: dict | None, snd: int, sq: int) -> list[dict]:
+    """A pending approval as BLE writes: a header, then the detail in chunks.
+
+    header {"so":1, "ai":id, "at":title, "ah":headline, "an":chunks, "snd", "sq"}
+    chunk  {"so":1, "ac":id, "d":"..."}   (in order; the board shows the prompt
+                                           once all `an` chunks have arrived)
+    """
     if not req:
-        return {"so": 1, "ai": 0}
-    title = ascii_only(req["title"], 16)
-    detail = ascii_only(req["detail"], 90)
-    # keep the JSON-escaped detail short enough for one BLE write
-    while len(json.dumps(detail)) > 110 and detail:
-        detail = detail[:-1]
-    return {"so": 1, "ai": req["id"], "at": title, "ad": detail, "snd": snd, "sq": sq}
+        return [{"so": 1, "ai": 0}]
+    title = ascii_only(req["title"], 24)
+    head = ascii_only(req.get("head", ""), 90)
+    detail = ascii_only(req["detail"], 600)
+    parts = _chunks(detail, CHUNK_BYTES) or [""]
+    header = {"so": 1, "ai": req["id"], "at": title, "ah": head, "an": len(parts),
+              "snd": snd, "sq": sq}
+    while len(json.dumps(header, separators=(",", ":"))) > MAX_WRITE and header["ah"]:
+        header["ah"] = header["ah"][:-1]
+    return [header] + [{"so": 1, "ac": req["id"], "d": p} for p in parts]
 
 
 def stats_message() -> dict:

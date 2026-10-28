@@ -23,7 +23,10 @@ struct UsageData {
     bool status_only;        // payload is a status push, not a fresh usage sample
     uint32_t ap_id;          // pending Claude Code approval request id (0 = none)
     char ap_title[32];       // e.g. "Run a command"
-    char ap_detail[160];     // e.g. "npm test" (only sent when it fits the screen)
+    char ap_head[100];       // Claude's one-line description ("" = none), the headline
+    char ap_detail[640];     // the full command / path / URL (scrolls on screen)
+    uint8_t ap_parts;        // detail chunks the host announced (0 = sent inline as "ad")
+    uint8_t ap_got;          // chunks received so far; the prompt shows when complete
     // ---- live session info (status messages) ----
     uint32_t turn_start_ms;  // millis() when the current Claude Code turn began (0 = none)
     char project[24];        // folder of the most recent session, e.g. "nexus-v2"

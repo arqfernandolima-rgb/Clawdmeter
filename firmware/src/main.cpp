@@ -165,7 +165,16 @@ static void parse_status_keys(JsonDocument& doc, UsageData* out) {
     if (doc["ai"].is<unsigned int>()) {
         out->ap_id = doc["ai"] | 0u;
         strlcpy(out->ap_title, doc["at"] | "", sizeof(out->ap_title));
+        strlcpy(out->ap_head, doc["ah"] | "", sizeof(out->ap_head));
         strlcpy(out->ap_detail, doc["ad"] | "", sizeof(out->ap_detail));
+        out->ap_parts = doc["an"] | 0;
+        out->ap_got = 0;
+    }
+    // Detail chunk for the pending approval, appended in arrival order.
+    if (doc["ac"].is<unsigned int>() && out->ap_id && (doc["ac"] | 0u) == out->ap_id) {
+        size_t n = strlen(out->ap_detail);
+        strlcpy(out->ap_detail + n, doc["d"] | "", sizeof(out->ap_detail) - n);
+        if (out->ap_got < 255) out->ap_got++;
     }
 }
 

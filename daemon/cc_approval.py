@@ -17,7 +17,7 @@ REQ_MAX_AGE = 150.0   # ignore a request file a crashed hook left behind
 
 
 def current_request() -> dict | None:
-    """The pending request {"id", "title", "detail"} or None."""
+    """The pending request {"id", "title", "head", "detail"} or None."""
     try:
         if time.time() - REQ.stat().st_mtime > REQ_MAX_AGE:
             return None
@@ -25,7 +25,8 @@ def current_request() -> dict | None:
         rid = int(r.get("id", 0))
         if rid <= 0:
             return None
-        return {"id": rid, "title": str(r.get("title", ""))[:30], "detail": str(r.get("detail", ""))[:150]}
+        return {"id": rid, "title": str(r.get("title", ""))[:30],
+                "head": str(r.get("head", ""))[:100], "detail": str(r.get("detail", ""))[:640]}
     except (OSError, ValueError, TypeError):
         return None
 

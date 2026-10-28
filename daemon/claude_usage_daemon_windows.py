@@ -794,11 +794,12 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                 if req_id != last_req_id:
                     if req_id:
                         view.approval_sound(cfg, dnd)
-                    msg = cc_board.approval_message(req, view.snd, view.snd_seq)
-                    if await session.write_payload(msg):
+                    for msg in cc_board.approval_messages(req, view.snd, view.snd_seq):
+                        if not await session.write_payload(msg):
+                            ok = False
+                            break
+                    if ok:
                         last_req_id = req_id
-                    else:
-                        ok = False
 
                 st = view.compute(last_payload.get("st"), cfg, approval_pending=bool(req), dnd=dnd)
                 key = {k: v for k, v in st.items() if k not in ("tt", "atd")}

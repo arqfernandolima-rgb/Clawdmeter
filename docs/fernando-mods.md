@@ -13,9 +13,12 @@ send the new messages gets the stock behavior.
   utilization moves in $5 steps, so the daemon adds Claude Code's local
   transcripts on top for a live figure with one decimal, plus dollars spent,
   the monthly limit and today's spend.
-- **Touchscreen approvals**: short permission prompts (one command, one file)
-  show Allow / Deny on the screen. Long or unclear ones, and anything while the
-  board is face-down or disconnected, fall through to Claude Code's normal prompt.
+- **Touchscreen approvals**: permission prompts show Allow / Deny on the screen,
+  headed by Claude's own one-line description of the command, with the full
+  command underneath in monospace. Commands up to 600 characters (multi-line
+  included) scroll, and Allow unlocks only after you've scrolled to the end.
+  Longer ones, plans and questions, and anything while the board is face-down
+  or disconnected, fall through to Claude Code's normal prompt.
 - **Attention screens + sounds**: "Claude needs you" when a permission prompt is
   waiting, "Your turn" after a long turn, a small celebration after a very long
   one. Sounds are synthesized on the ES8311 codec.
@@ -40,7 +43,7 @@ send the new messages gets the stock behavior.
 |---|---|---|
 | usage | (none) | `s sr w wr st acct tp pd rd ok` + `sl sd td op` (spend), `vol fz` (settings), `t tf c` |
 | status | `"so":1` | `cs a tt pj ns att aq atd atp snd sq` (partial: only keys present change) |
-| approval | `"so":1` + `ai` | `ai at ad snd sq` (`ai:0` clears) |
+| approval | `"so":1` + `ai` | header `ai at ah an snd sq`, then `an` chunks `{"so":1,"ac":id,"d":...}` in order (`ai:0` clears) |
 | stats | `"hs":1` | `dh di dm kt kf kp ka km kr` |
 | max | `"hm":1` | `s sr w wr e` (+ optional `m mr mn` per-model weekly limit); `e`: 0 ok, 1 not signed in, 2 sign-in expired |
 

@@ -685,8 +685,15 @@ static void init_usage_screen(lv_obj_t* scr) {
 // ai=0 and the prompt closes. Touch only: the side buttons stay HID keys so a
 // stray press can never approve anything.
 static lv_obj_t* ap_box = nullptr;
-static lv_obj_t* ap_title = nullptr;
+static lv_obj_t* ap_kicker = nullptr;   // "Run a command" (or "Claude Code wants to")
+static lv_obj_t* ap_title = nullptr;    // Claude's description, or the action in big type
+static lv_obj_t* ap_panel = nullptr;    // scrolls when the command is long
 static lv_obj_t* ap_detail = nullptr;
+static lv_obj_t* ap_hint = nullptr;
+static lv_obj_t* ap_allow_btn = nullptr;
+static lv_obj_t* ap_allow_lbl = nullptr;
+static bool      ap_locked = false;     // Allow waits until the whole command was on screen
+static int       ap_hint_y = 0;
 static uint32_t  ap_shown_id = 0;      // request currently on screen
 static uint32_t  ap_answered_id = 0;   // answered here; ignore until the host clears it
 static bool      ap_visible = false;
@@ -696,9 +703,25 @@ static screen_t  ap_prev_screen = SCREEN_USAGE;
 static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
                                 const char* text, lv_color_t bg, lv_color_t fg, bool allow);
 
+static void ap_set_locked(bool locked) {
+    ap_locked = locked;
+    if (!ap_allow_btn) return;
+    lv_obj_set_style_bg_color(ap_allow_btn, locked ? COL_BAR_BG : COL_GREEN, 0);
+    lv_obj_set_style_text_color(ap_allow_lbl, locked ? COL_DIM : COL_TEXT, 0);
+    lv_label_set_text(ap_hint, locked ? "Scroll to the end to allow" : "or answer at your keyboard");
+    lv_obj_set_style_text_color(ap_hint, locked ? COL_AMBER : COL_DIM, 0);
+    lv_obj_align(ap_hint, LV_ALIGN_TOP_MID, 0, ap_hint_y);
+}
+
+static void ap_scroll_cb(lv_event_t* e) {
+    (void)e;
+    if (ap_locked && lv_obj_get_scroll_bottom(ap_panel) <= 4) ap_set_locked(false);
+}
+
 static void ap_button_cb(lv_event_t* e) {
     bool allow = (bool)(uintptr_t)lv_event_get_user_data(e);
     if (!ap_visible || ap_shown_id == 0) return;
+    if (allow && ap_locked) return;      // read it all first
     ble_send_approval(ap_shown_id, allow);
     ap_answered_id = ap_shown_id;
     strlcpy(s_cc_status, allow ? "Allowed" : "Denied", sizeof(s_cc_status));
@@ -722,6 +745,7 @@ static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
     lv_obj_set_style_text_font(l, L.pct_font, 0);
     lv_obj_set_style_text_color(l, fg, 0);
     lv_obj_center(l);
+    if (allow) { ap_allow_btn = b; ap_allow_lbl = l; }
     return b;
 }
 
@@ -730,10 +754,11 @@ static void build_approval(lv_obj_t* parent) {
     const int btn_h = L.small_icons ? 50 : 100;
     const int btn_w = (L.content_w - gap) / 2;
     const int btn_y = L.scr_h - L.margin - btn_h;
-    const int top = L.small_icons ? 6 : L.title_y + 10;
-    const int title_y = top + (L.small_icons ? 20 : 44);
-    const int panel_y = title_y + (L.small_icons ? 34 : 66);
-    const int panel_h = btn_y - panel_y - (L.small_icons ? 26 : 48);
+    const int top = L.small_icons ? 6 : L.title_y + 6;
+    const int title_y = top + (L.small_icons ? 18 : 32);
+    const int head_h = 2 * lv_font_get_line_height(L.reset_font) + 4;    // two lines
+    const int panel_y = title_y + head_h + (L.small_icons ? 6 : 10);
+    const int panel_h = btn_y - panel_y - (L.small_icons ? 22 : 36);
 
     ap_box = lv_obj_create(parent);
     lv_obj_set_pos(ap_box, 0, 0);
@@ -745,32 +770,48 @@ static void build_approval(lv_obj_t* parent) {
     lv_obj_set_style_radius(ap_box, 0, 0);
     lv_obj_clear_flag(ap_box, LV_OBJ_FLAG_SCROLLABLE);   // stays clickable: swallows stray taps
 
-    lv_obj_t* kicker = lv_label_create(ap_box);
-    lv_label_set_text(kicker, "Claude Code wants to");
-    lv_obj_set_style_text_font(kicker, L.reset_font, 0);
-    lv_obj_set_style_text_color(kicker, COL_DIM, 0);
-    lv_obj_align(kicker, LV_ALIGN_TOP_MID, 0, top);
+    ap_kicker = lv_label_create(ap_box);
+    lv_label_set_text(ap_kicker, "Claude Code wants to");
+    lv_obj_set_style_text_font(ap_kicker, L.today_font, 0);
+    lv_obj_set_style_text_color(ap_kicker, COL_DIM, 0);
+    lv_obj_align(ap_kicker, LV_ALIGN_TOP_MID, 0, top);
 
+    // Headline: Claude's own description of the command (two lines max), or
+    // the action itself in big type when there's no description.
     ap_title = lv_label_create(ap_box);
     lv_label_set_text(ap_title, "");
-    lv_obj_set_style_text_font(ap_title, L.pct_font, 0);
+    lv_obj_set_style_text_font(ap_title, L.reset_font, 0);
     lv_obj_set_style_text_color(ap_title, COL_ACCENT, 0);
-    lv_obj_align(ap_title, LV_ALIGN_TOP_MID, 0, title_y);
+    lv_obj_set_style_text_align(ap_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(ap_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(ap_title, L.content_w, head_h);
+    lv_obj_set_pos(ap_title, L.margin, title_y);
 
-    lv_obj_t* panel = make_panel(ap_box, L.margin, panel_y, L.content_w, panel_h);
-    ap_detail = lv_label_create(panel);
+    // The full command in monospace, wrapped; drag to scroll when it's long.
+    ap_panel = make_panel(ap_box, L.margin, panel_y, L.content_w, panel_h);
+    lv_obj_add_flag(ap_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(ap_panel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ap_panel, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(ap_panel, COL_DIM, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(ap_panel, LV_OPA_70, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(ap_panel, 4, LV_PART_SCROLLBAR);
+    lv_obj_add_event_cb(ap_panel, ap_scroll_cb, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(ap_panel, ap_scroll_cb, LV_EVENT_SCROLL_END, NULL);
+    ap_detail = lv_label_create(ap_panel);
     lv_label_set_text(ap_detail, "");
-    lv_obj_set_style_text_font(ap_detail, L.reset_font, 0);
+    lv_obj_set_style_text_font(ap_detail, &font_mono_18, 0);
     lv_obj_set_style_text_color(ap_detail, COL_TEXT, 0);
-    lv_label_set_long_mode(ap_detail, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(ap_detail, L.content_w - 2 * L.panel_pad_x, panel_h - 2 * L.panel_pad_y);
+    lv_obj_set_style_text_line_space(ap_detail, 3, 0);
+    lv_label_set_long_mode(ap_detail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ap_detail, L.content_w - 2 * L.panel_pad_x - 8);   // room for the scrollbar
     lv_obj_set_pos(ap_detail, 0, 0);
 
-    lv_obj_t* hint = lv_label_create(ap_box);
-    lv_label_set_text(hint, "or answer at your keyboard");
-    lv_obj_set_style_text_font(hint, L.pace_font, 0);
-    lv_obj_set_style_text_color(hint, COL_DIM, 0);
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, panel_y + panel_h + (L.small_icons ? 6 : 14));
+    ap_hint_y = panel_y + panel_h + (L.small_icons ? 4 : 8);
+    ap_hint = lv_label_create(ap_box);
+    lv_label_set_text(ap_hint, "or answer at your keyboard");
+    lv_obj_set_style_text_font(ap_hint, L.pace_font, 0);
+    lv_obj_set_style_text_color(ap_hint, COL_DIM, 0);
+    lv_obj_align(ap_hint, LV_ALIGN_TOP_MID, 0, ap_hint_y);
 
     make_ap_button(ap_box, L.margin, btn_y, btn_w, btn_h, "Deny", COL_PANEL, COL_TEXT, false);
     make_ap_button(ap_box, L.margin + btn_w + gap, btn_y, btn_w, btn_h, "Allow", COL_GREEN, COL_TEXT, true);
@@ -797,8 +838,19 @@ static void approval_update(const UsageData* data) {
     }
     if (data->ap_id == ap_answered_id) return;           // answered here, awaiting clear
     if (ap_visible && data->ap_id == ap_shown_id) return; // already showing it
+    if (data->ap_parts && data->ap_got < data->ap_parts) return;   // detail still arriving
 
-    lv_label_set_text(ap_title, data->ap_title[0] ? data->ap_title : "Use a tool");
+    const char* action = data->ap_title[0] ? data->ap_title : "Use a tool";
+    if (data->ap_head[0]) {                // "Run a command" / Claude's description
+        lv_label_set_text(ap_kicker, action);
+        lv_obj_set_style_text_font(ap_title, L.reset_font, 0);
+        lv_label_set_text(ap_title, data->ap_head);
+    } else {                               // "Claude Code wants to" / "Edit a file"
+        lv_label_set_text(ap_kicker, "Claude Code wants to");
+        lv_obj_set_style_text_font(ap_title, L.pct_font, 0);
+        lv_label_set_text(ap_title, action);
+    }
+    lv_obj_align(ap_kicker, LV_ALIGN_TOP_MID, 0, L.small_icons ? 6 : L.title_y + 6);
     lv_label_set_text(ap_detail, data->ap_detail);
     ap_shown_id = data->ap_id;
     if (!ap_visible) ap_prev_screen = current_screen;
@@ -806,6 +858,10 @@ static void approval_update(const UsageData* data) {
     lv_obj_clear_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(ap_box);
     ap_visible = true;
+    // Long command? Start at the top and keep Allow locked until the end was shown.
+    lv_obj_scroll_to_y(ap_panel, 0, LV_ANIM_OFF);
+    lv_obj_update_layout(ap_box);
+    ap_set_locked(lv_obj_get_scroll_bottom(ap_panel) > 4);
     idle_note_activity();                // wake the panel for it
     Serial.printf("approval: showing %lu (%s)\n", (unsigned long)ap_shown_id, data->ap_title);
 }
