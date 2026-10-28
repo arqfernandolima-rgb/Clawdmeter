@@ -26,13 +26,23 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
+try:  # imported as daemon.claude_usage_daemon_windows (tray) or run directly
+    from daemon import cc_accounts, cc_approval, cc_board, cc_spend, cc_status
+except ImportError:
+    import cc_accounts
+    import cc_approval
+    import cc_board
+    import cc_spend
+    import cc_status
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
-TICK = 5
+TICK = 1   # loop granularity; was 5 — 1 s keeps Claude Code status pushes snappy
+RETRY_MIN_S = 5  # min seconds between API attempts (the old TICK cadence)
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -183,6 +193,55 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+def read_config_value(key: str) -> str | None:
+    """Return the raw value of `key` from the config file, or None."""
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+def add_spend_fields(payload: dict) -> None:
+    """Enterprise: add "sd" (dollars spent) and "sl" (limit) when the config sets
+    monthly_limit_usd. The API only exposes a utilization fraction, so dollars
+    are derived from it (resolution = 1% of the limit)."""
+    if payload.get("acct") != "ent":
+        return
+    raw = read_config_value("monthly_limit_usd")
+    if not raw:
+        return
+    try:
+        limit = float(raw.replace("$", "").replace(",", ""))
+    except ValueError:
+        return
+    if limit <= 0:
+        return
+    payload["sl"] = round(limit, 2)
+    official = payload.get("s", 0)
+    payload["op"] = official                         # official whole-% figure (board ignores it; handy in the log)
+    try:
+        live = cc_spend.live_figures(float(official), limit)
+    except Exception as e:                           # estimate must never break a poll
+        log(f"Live spend estimate failed: {e}")
+        payload["sd"] = round(official / 100.0 * limit, 2)
+        return
+    # Live estimate drives the number, bar and pace; one decimal on the board.
+    payload["s"] = round(live["live_pct"], 1)
+    payload["sd"] = round(live["live_usd"], 2)
+    payload["td"] = round(live["today_usd"], 2)
+
+
+_HEADER_SETS_LOGGED: set[tuple] = set()
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -222,6 +281,13 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
+    # Header names only (no values, never the token): helps spot new limit kinds.
+    names = tuple(sorted(k.lower()[len("anthropic-ratelimit-unified-"):] for k in resp.headers.keys()
+                         if k.lower().startswith("anthropic-ratelimit-unified-")))
+    if names and names not in _HEADER_SETS_LOGGED:
+        _HEADER_SETS_LOGGED.add(names)
+        log(f"Rate-limit headers: {', '.join(names)}")
+
     if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
         payload = {
             "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
@@ -232,6 +298,12 @@ async def poll_api(token: str) -> dict | None:
             "acct": "pro",
             "ok": True,
         }
+        ml = cc_accounts.model_limit(resp.headers)   # e.g. a separate Sonnet weekly limit
+        if ml:
+            name, util_h, reset_h = ml
+            payload["m"] = pct(hdr(util_h))
+            payload["mr"] = reset_minutes(hdr(reset_h, ""))
+            payload["mn"] = name
     else:
         reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
         payload = {
@@ -374,8 +446,32 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.approval_changed = False
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
+    def _on_refresh(self, _char, data: bytearray) -> None:
+        # The same notify characteristic also carries approval answers from the
+        # board's touchscreen: "A<id>:1" (allow) / "A<id>:0" (deny).
+        answer = cc_approval.parse_answer(data)
+        if answer is not None:
+            rid, allow = answer
+            log(f"Approval {rid}: {'allow' if allow else 'deny'} (from the board)")
+            try:
+                cc_approval.write_answer(rid, allow)
+                cc_approval.count_approval()
+            except OSError as e:
+                log(f"Couldn't write approval answer: {e}")
+            self.approval_changed = True
+            return
+        vol = cc_board.parse_volume(data)
+        if vol is not None:
+            log(f"Volume set on the board: {vol}")
+            cc_board.set_volume(vol)
+            return
+        dnd = cc_approval.parse_dnd(data)
+        if dnd is not None:
+            log(f"Board {'face-down: quiet, approvals at the keyboard' if dnd else 'face-up again'}")
+            cc_approval.set_dnd(dnd)
+            return
         log("Refresh requested by device")
         self.refresh_requested.set()
 
@@ -524,6 +620,32 @@ async def _wait_first(*events: asyncio.Event, timeout: float) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+KEEPER = cc_accounts.TokenKeeper(log)   # renews Claude Code sign-ins before they expire
+
+
+def primary_cred_path() -> Path | None:
+    for p in _windows_credential_candidates():
+        if p.exists():
+            return p
+    return None
+
+
+async def poll_max(mdir: Path, cfg: dict) -> dict | None:
+    """Max-screen message for the second account; None = transient, try next poll."""
+    cred = mdir / ".credentials.json"
+    tok, _ = cc_accounts.read_creds(cred)
+    if not tok:
+        return cc_accounts.max_message(None, 1)
+    KEEPER.kick("Max", cred, mdir, cfg)
+    try:
+        payload = await poll_api(tok)
+    except AuthError:
+        KEEPER.kick("Max", cred, mdir, cfg, force=True)
+        # one 401 right at expiry is normal: the keep-alive is already renewing
+        return cc_accounts.max_message(None, 2) if KEEPER.failing("Max") else None
+    return cc_accounts.max_message(payload) if payload is not None else None
+
+
 async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) -> bool:
     """Connect to device and poll until disconnected or stopped.
 
@@ -587,14 +709,37 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     await session.setup_refresh_subscription()
 
     last_poll = 0.0  # D-03: poll immediately on first connect
+    last_payload: dict | None = None   # most recent usage payload (api status for the view)
+    view = cc_status.StatusView()      # status text, project, timers, attention, sounds
+    last_status_key = None             # status message last sent (minus the ticking timers)
+    last_status_sent = 0.0
+    last_req_id = None                 # approval request id last sent (0 = none)
+    last_stats: dict | None = None
+    last_stats_ts = 0.0
+    ha = cc_board.HaNotifier(log)
+    last_attempt = 0.0
+    pending_refresh = False
+    last_alive = 0.0
+    last_max_poll = 0.0
+    cc_approval.set_dnd(False)        # a fresh connection starts face-up until told otherwise
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            # The loop now ticks every 1 s (for status pushes), so API attempts are
+            # gated separately: never more often than RETRY_MIN_S, which keeps a
+            # failing token/network from being retried every second.
+            if session.refresh_requested.is_set():
                 session.refresh_requested.clear()
+                pending_refresh = True
+                last_max_poll = 0.0
+            if (pending_refresh or elapsed >= POLL_INTERVAL) and now - last_attempt >= RETRY_MIN_S:
+                pending_refresh = False
+                last_attempt = now
+                cfg_now = cc_board.read_cfg()
+                KEEPER.kick("work", primary_cred_path(), None, cfg_now)
                 token = read_token()  # D-09: fresh each cycle
                 if not token:
                     log("No token; skipping poll")
@@ -605,10 +750,14 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                         payload = await poll_api(token)
                     except AuthError:
                         # Real 401/403 — token genuinely needs a refresh.
+                        KEEPER.kick("work", primary_cred_path(), None, cfg_now, force=True)
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
                         payload = None
                     if payload is not None:
+                        add_spend_fields(payload)
+                        cc_board.add_usage_extras(payload, cc_board.read_cfg())
+                        last_payload = dict(payload)
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
@@ -628,6 +777,70 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                     # toast "token expired" — that mislabeled a boot-time DNS blip
                     # as an auth problem (SC#5). Leave tray state unchanged; the next
                     # tick retries and set_connected() recovers it.
+
+            if client.is_connected and time.time() - last_alive >= 2:
+                last_alive = time.time()
+                cc_approval.touch_alive()   # tells the approval hook the board is reachable
+
+            # Status / approval / stats messages, once the board has a usage
+            # baseline. Each is its own small BLE write (see cc_board.py).
+            if last_payload is not None and client.is_connected:
+                cfg = cc_board.read_cfg()
+                dnd = cc_approval.dnd_on()
+                req = cc_approval.current_request()
+                req_id = req["id"] if req else 0
+                ok = True
+
+                if req_id != last_req_id:
+                    if req_id:
+                        view.approval_sound(cfg, dnd)
+                    msg = cc_board.approval_message(req, view.snd, view.snd_seq)
+                    if await session.write_payload(msg):
+                        last_req_id = req_id
+                    else:
+                        ok = False
+
+                st = view.compute(last_payload.get("st"), cfg, approval_pending=bool(req), dnd=dnd)
+                key = {k: v for k, v in st.items() if k not in ("tt", "atd")}
+                if ok and (key != last_status_key or time.time() - last_status_sent >= 300):
+                    if await session.write_payload({"so": 1, **st}):
+                        last_status_key = key
+                        last_status_sent = time.time()
+                    else:
+                        ok = False
+                ha.update(st, cfg)
+
+                if ok and time.time() - last_stats_ts >= 60:
+                    last_stats_ts = time.time()
+                    try:
+                        stats = await asyncio.to_thread(cc_board.stats_message)
+                    except Exception as e:          # stats must never break the link
+                        log(f"Stats failed: {e}")
+                        stats = None
+                    if stats and stats != last_stats:
+                        if await session.write_payload(stats):
+                            last_stats = stats
+                        else:
+                            ok = False
+
+                # Second account (personal Max plan) for the board's Max screen.
+                mdir = cc_accounts.max_dir(cfg)
+                if ok and mdir is not None and time.time() - last_max_poll >= POLL_INTERVAL:
+                    last_max_poll = time.time()
+                    try:
+                        mmsg = await poll_max(mdir, cfg)
+                    except Exception as e:          # never break the link over it
+                        log(f"Max poll failed: {e}")
+                        mmsg = None
+                    if mmsg is not None and not await session.write_payload(mmsg):
+                        ok = False
+
+                if not ok:
+                    consecutive_failures += 1
+                    if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
+                        log(f"Zombie link detected ({consecutive_failures} consecutive"
+                            f" write failures); abandoning connection")
+                        break
 
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run

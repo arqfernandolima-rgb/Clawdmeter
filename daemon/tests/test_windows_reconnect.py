@@ -238,6 +238,11 @@ def test_zombie_counter_resets_on_success_with_raised_limit(monkeypatch):
     write_call_count2 = [0]
 
     async def fake_write_payload2(payload):
+        # Status / stats / Max pushes ride the same link between usage polls;
+        # this test is about the usage poll's counter, so they always succeed
+        # and don't consume the sequence.
+        if any(k in payload for k in ("so", "hs", "hm")):
+            return True
         write_call_count2[0] += 1
         if write_call_count2[0] - 1 < len(write_results2):
             return write_results2[write_call_count2[0] - 1]
@@ -252,6 +257,8 @@ def test_zombie_counter_resets_on_success_with_raised_limit(monkeypatch):
 
     monkeypatch.setattr(mod, "POLL_INTERVAL", 0)
     monkeypatch.setattr(mod, "ZOMBIE_BREAK_LIMIT", 2)  # raise limit to test reset logic
+    monkeypatch.setattr(mod, "RETRY_MIN_S", 0)          # don't wait out the real retry spacing
+    monkeypatch.setattr(mod, "TICK", 0.01)
 
     async def fast_wait_for(coro, timeout):
         raise asyncio.TimeoutError()
