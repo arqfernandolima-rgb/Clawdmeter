@@ -447,6 +447,34 @@ void ble_request_refresh(void) {
     }
 }
 
+void ble_send_approval(uint32_t id, bool allow) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        char msg[24];
+        int n = snprintf(msg, sizeof(msg), "A%lu:%d", (unsigned long)id, allow ? 1 : 0);
+        req_char->setValue((const uint8_t*)msg, (size_t)n);
+        req_char->notify();
+        Serial.printf("BLE: approval %lu -> %s\n", (unsigned long)id, allow ? "allow" : "deny");
+    }
+}
+
+void ble_send_dnd(bool on) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        const char* msg = on ? "D1" : "D0";
+        req_char->setValue((const uint8_t*)msg, 2);
+        req_char->notify();
+        Serial.printf("BLE: do-not-disturb %s\n", on ? "on" : "off");
+    }
+}
+
+void ble_send_volume(uint8_t volume) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        char msg[8];
+        int n = snprintf(msg, sizeof(msg), "V%u", (unsigned)volume);
+        req_char->setValue((const uint8_t*)msg, (size_t)n);
+        req_char->notify();
+    }
+}
+
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     if (state != BLE_STATE_CONNECTED || !input_kbd) return;
     // HID report: [modifier, reserved, key1, key2, key3, key4, key5, key6]

@@ -20,6 +20,13 @@ const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
+// Answer a Claude Code approval request: notifies "A<id>:1" (allow) or "A<id>:0"
+// (deny) on the request characteristic the daemon already subscribes to.
+void ble_send_approval(uint32_t id, bool allow);
+// Tell the host the board went face-down ("D1") or back up ("D0").
+void ble_send_dnd(bool on);
+// Tell the host the speaker volume was changed on the board ("V0".."V100").
+void ble_send_volume(uint8_t volume);
 
 void ble_set_battery_level(int pct);
 

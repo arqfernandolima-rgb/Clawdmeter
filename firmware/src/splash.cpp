@@ -68,6 +68,10 @@ static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
 // groups decide. `forced_req` remembers what the host last asked for so a poll
 // repeating the same name is a no-op rather than a re-render.
 static int  forced_idx = -1;
+// Short local reactions (shake, pick-up) borrow the splash for a few seconds
+// and then hand it back to the host's / usage-rate choice.
+static int      temp_idx = -1;
+static uint32_t temp_until = 0;
 static char forced_req[24] = "";
 
 static void resolve_group_lists(void) {
@@ -245,6 +249,21 @@ lv_obj_t* splash_mini_create(lv_obj_t *parent, const char *anim_name, int px) {
     return mini_canvas;
 }
 
+void splash_mini_set_anim(const char *anim_name) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, anim_name) == 0) {
+            if (mini_anim == &splash_anims[i]) return;
+            mini_anim = &splash_anims[i];
+            mini_frame = 0;
+            mini_started = millis();
+            mini_render();
+            return;
+        }
+    }
+}
+
+lv_obj_t* splash_mini_obj(void) { return mini_canvas; }
+
 void splash_mini_tick(void) {
     if (!mini_buf || !mini_anim || mini_anim->frame_count == 0) return;
     if (millis() - mini_started < mini_anim->holds[mini_frame]) return;
@@ -358,6 +377,11 @@ void splash_tick(void) {
     // over it. Standing still for the two seconds it runs is enough.
     if (charge_anim_is_active()) return;
 
+    if (temp_idx >= 0 && (int32_t)(millis() - temp_until) >= 0) {
+        temp_idx = -1;
+        splash_pick_for_current_rate();      // back to the host's / group choice
+    }
+
 #if SPLASH_DIRECT_DRAW
     // Voller Neuaufbau nach dem Wiederanzeigen — erst wenn LVGL einen
     // kompletten Durchlauf abgeschlossen hat, sonst uebermalen die restlichen
@@ -376,7 +400,7 @@ void splash_tick(void) {
     // Auto-rotate to the next animation in the current group. Suspended while
     // the host drives the animation — otherwise its choice would be dropped
     // after SPLASH_ROTATE_INTERVAL_MS.
-    if (forced_idx < 0 && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
+    if (forced_idx < 0 && temp_idx < 0 && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
         splash_pick_for_current_rate();
     }
 
@@ -421,14 +445,14 @@ void splash_set_anim(const char *name) {
     if (name[0] == '\0') {                 // host released control
         forced_idx = -1;
         Serial.println("splash: host released, back to usage-rate groups");
-        if (active) splash_pick_for_current_rate();
+        if (active && temp_idx < 0) splash_pick_for_current_rate();
         return;
     }
     for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
         if (strcmp(splash_anims[i].name, name) == 0) {
             forced_idx = i;
             Serial.printf("splash: host -> %s\n", name);
-            if (active) show_anim(i);
+            if (active && temp_idx < 0) show_anim(i);
             return;
         }
     }
@@ -438,8 +462,20 @@ void splash_set_anim(const char *name) {
     Serial.printf("splash: host asked for unknown anim '%s', ignoring\n", name);
 }
 
+void splash_play_temp(const char *name, uint32_t ms) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, name) == 0) {
+            temp_idx = i;
+            temp_until = millis() + ms;
+            if (active) show_anim(i);
+            return;
+        }
+    }
+}
+
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+    if (temp_idx >= 0) { show_anim(temp_idx); return; }
     if (forced_idx >= 0) { show_anim(forced_idx); return; }
     int g = usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;

@@ -9,3 +9,8 @@
 void    imu_hal_init(void);
 void    imu_hal_tick(void);
 uint8_t imu_hal_rotation_quadrant(void);
+
+// Raw acceleration in g for the shared motion logic (motion.cpp): shake,
+// pick-up and face-down detection. Returns false on boards that don't provide
+// it (weak default in hal_defaults.cpp), which turns those features off.
+bool imu_hal_read_accel(float* x, float* y, float* z);

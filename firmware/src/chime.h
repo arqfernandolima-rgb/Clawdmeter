@@ -29,5 +29,18 @@ bool chime_init(const ChimeConfig& cfg);
 // or already playing.
 void chime_play(void);
 
+// Sound ids. BELL is the embedded clip; the rest are synthesized on the fly.
+enum {
+    CHIME_BELL = 0,
+    CHIME_ATTENTION = 1,   // Claude needs you (two rising notes, twice)
+    CHIME_DING = 2,        // your turn (soft single bell)
+    CHIME_FANFARE = 3,     // long task finished
+    CHIME_BOING = 4,       // shake reaction
+    CHIME_BLIP = 5,        // pick-up / acknowledgement
+    CHIME_PREVIEW = 6,     // volume preview: one note of the attention sound
+};
+void chime_play_id(uint8_t id);        // non-blocking; no-op while another sound plays
+void chime_set_volume(uint8_t volume); // 0..100, applied to the codec immediately
+
 // Currently a no-op (playback runs in its own task); kept for HAL symmetry.
 void chime_tick(void);

@@ -35,6 +35,10 @@ void splash_pick_for_current_rate(void);
 // fight the PWR button.
 void splash_set_anim(const char *name);
 
+// Play `name` for `ms` milliseconds (a local reaction such as a shake), then
+// return to whatever the host or the usage-rate groups had chosen.
+void splash_play_temp(const char *name, uint32_t ms);
+
 // Aus dem LVGL-Flush-Callback zu rufen, sobald der letzte Streifen eines
 // Bilddurchlaufs draussen ist. Der Splash malt auf manchen Boards direkt auf
 // den Panel und muss wissen, wann LVGL fertig ist - sonst uebermalt ein noch
@@ -54,3 +58,7 @@ lv_obj_t* splash_get_root(void);
 // splash_mini_tick(). One mini creature at a time.
 lv_obj_t* splash_mini_create(lv_obj_t *parent, const char *anim_name, int px);
 void splash_mini_tick(void);
+// Switch the mini creature's animation / get its canvas (to move it to another
+// parent, e.g. the attention screen borrows it from the idle screen).
+void splash_mini_set_anim(const char *anim_name);
+lv_obj_t* splash_mini_obj(void);

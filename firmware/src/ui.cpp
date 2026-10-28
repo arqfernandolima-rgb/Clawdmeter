@@ -3,9 +3,13 @@
 #include "charge_anim.h"
 #include <lvgl.h>
 #include <time.h>
+#include <math.h>
 #include "logo.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "ble.h"
+#include "idle.h"
+#include "chime.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -45,7 +49,9 @@ struct Layout {
     const lv_font_t* pill_font;      // "Current" / "Weekly" pill
     const lv_font_t* reset_font;     // "Resets in ..." line
     const lv_font_t* pace_font;      // enterprise "Under/On/Over pace" line
-    const lv_font_t* anim_font;      // animated status line
+    const lv_font_t* today_font;     // enterprise "$x.xx today" (one step under reset_font)
+    const lv_font_t* anim_font;      // status line text (geometric)
+    const lv_font_t* anim_glyph_font;// status line spinner glyph (mono: has the dingbats)
     int16_t anim_y;                  // status line offset from bottom
     bool    small_icons;             // 40px logo + 24px battery (vs 80/48) on small screens
     int16_t title_nudge;             // title x-shift balancing the corner logo
@@ -91,7 +97,9 @@ static void compute_layout(const BoardCaps& c) {
     L.pill_font    = &font_styrene_28;
     L.reset_font   = &font_styrene_28;
     L.pace_font    = &font_styrene_16;
-    L.anim_font    = &font_mono_32;
+    L.today_font   = &font_styrene_24;
+    L.anim_font    = &font_styrene_28;
+    L.anim_glyph_font = &font_mono_32;
     L.anim_y = -15;
     L.small_icons = false;
     L.title_nudge = 16;
@@ -153,7 +161,9 @@ static void compute_layout(const BoardCaps& c) {
         L.pill_font    = &font_styrene_14;
         L.reset_font   = &font_styrene_14;
         L.pace_font    = &font_styrene_12;
-        L.anim_font    = &font_mono_18;
+        L.today_font   = &font_styrene_12;
+        L.anim_font    = &font_styrene_14;
+        L.anim_glyph_font = &font_mono_18;
         // Center the status line in the strip below the weekly panel; flush
         // against the bottom edge it reads as unevenly spaced.
         L.anim_y = -10;
@@ -192,6 +202,9 @@ static void compute_layout(const BoardCaps& c) {
 
 // ---- Usage screen widgets (single non-splash view) ----
 static lv_obj_t* usage_container;
+static lv_obj_t* stats_container = nullptr;
+static lv_obj_t* max_container = nullptr;   // second account (personal Max plan)
+static bool      s_max_seen = false;        // host sent an "hm" -> screen joins the tap cycle
 static lv_obj_t* lbl_title;
 // Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
 // which it landed, so the title ticks forward locally between 60s payloads.
@@ -213,13 +226,47 @@ static lv_obj_t* panel_session = nullptr;
 static lv_obj_t* panel_weekly = nullptr;
 // Enterprise-only widgets inside panel_session
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
+static lv_obj_t* lbl_weekly_pct_sym = nullptr;   // same treatment for the second number
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
-static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
+static lv_obj_t* lbl_spending_today = nullptr;    // "$4.30 today", right-aligned on the dollar line
+static lv_obj_t* lbl_anim;      // status line text: connection state / Claude Code status
+static lv_obj_t* lbl_anim_glyph;// status line spinner glyph (separate label, mono font)
+static lv_obj_t* anim_row;      // centers glyph + text as one unit
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
+static int       logo_mode = -1;        // 0 float (idle), 1 bob (Claude busy); -1 stopped
+
+static void logo_y_cb(void* obj, int32_t v) { lv_obj_set_y((lv_obj_t*)obj, v); }
+
+// Moving the logo only invalidates its own 80x84 box, and only when the
+// integer y changes (a few times a second), so this is cheap even on the C6.
+// It's stopped on the splash: there the C6 draws straight to the panel and an
+// LVGL repaint under the logo would scribble over Clawd.
+static void logo_anim_apply(int mode) {
+    if (!logo_img) return;
+    if (mode == logo_mode) return;
+    lv_anim_delete(logo_img, logo_y_cb);
+    lv_obj_set_y(logo_img, L.logo_y);
+    logo_mode = mode;
+    if (mode < 0) return;
+    const int amp = L.small_icons ? 2 : (mode == 1 ? 5 : 3);
+    const uint32_t half = mode == 1 ? 380 : 1400;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, logo_img);
+    lv_anim_set_exec_cb(&a, logo_y_cb);
+    lv_anim_set_values(&a, L.logo_y, L.logo_y - amp);
+    lv_anim_set_duration(&a, half);
+    lv_anim_set_reverse_duration(&a, half);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+}
+
+static int logo_wanted_mode(void);   // defined after the status statics
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
 // ---- Live-data freshness → which usage sub-view to show ----
@@ -237,6 +284,16 @@ static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
+static bool     s_cc_live = false;         // host sends real Claude Code status ("cs")
+static char     s_cc_status[24] = "";      // last status text from the host
+static uint32_t s_turn_start_ms = 0;       // local millis() when the current turn began
+static char     s_project[24] = "";        // most recent session's folder name
+static uint8_t  s_sessions = 0;            // active Claude Code sessions
+
+static int logo_wanted_mode(void) {
+    if (current_screen == SCREEN_SPLASH) return -1;
+    return (s_cc_live && strstr(s_cc_status, "\xE2\x80\xA6") != NULL) ? 1 : 0;
+}
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -292,6 +349,33 @@ static const char* const anim_messages[] = {
 };
 #define ANIM_MSG_COUNT (sizeof(anim_messages) / sizeof(anim_messages[0]))
 
+// Status line setter. Styrene's subset is ASCII-only, so a trailing "…"
+// (U+2026) is drawn as "..."; identical updates are skipped (the C6 repaints
+// in strips, so needless redraws cost real time).
+static void set_status_line(const char* glyph, const char* text) {
+    static char last_glyph[8] = "";
+    static char last_text[48] = "";
+    char t[48];
+    size_t j = 0;
+    for (size_t i = 0; text[i] && j < sizeof(t) - 4; ) {
+        if ((uint8_t)text[i] == 0xE2 && (uint8_t)text[i + 1] == 0x80 && (uint8_t)text[i + 2] == 0xA6) {
+            t[j++] = '.'; t[j++] = '.'; t[j++] = '.';
+            i += 3;
+        } else {
+            t[j++] = text[i++];
+        }
+    }
+    t[j] = '\0';
+    if (strcmp(glyph, last_glyph) != 0) {
+        strlcpy(last_glyph, glyph, sizeof(last_glyph));
+        lv_label_set_text(lbl_anim_glyph, glyph);
+    }
+    if (strcmp(t, last_text) != 0) {
+        strlcpy(last_text, t, sizeof(last_text));
+        lv_label_set_text(lbl_anim, t);
+    }
+}
+
 static lv_color_t pct_color(float pct) {
     if (pct >= 80.0f) return COL_RED;
     if (pct >= 50.0f) return COL_AMBER;
@@ -312,6 +396,19 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void build_approval(lv_obj_t* parent);
+static void approval_update(const UsageData* data);
+static void approval_hide(void);
+static void build_attention(lv_obj_t* parent);
+static void attention_update(const UsageData* data);
+static void attention_tick(void);
+static void build_spark(lv_obj_t* panel);
+static void spark_update(const UsageData* data, lv_color_t pace);
+static void init_stats_screen(lv_obj_t* scr);
+static void stats_update(const UsageData* data);
+static void init_max_screen(lv_obj_t* scr);
+static void max_update(const UsageData* data);
+static void max_tick(void);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -393,8 +490,8 @@ static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text
     lv_obj_t* panel = make_panel(parent, L.margin, y, L.content_w, L.usage_panel_h);
 
     *out_pct = lv_label_create(panel);
-    lv_label_set_text(*out_pct, "---%");
-    lv_obj_set_style_text_font(*out_pct, L.pct_font, 0);
+    lv_label_set_text(*out_pct, "--");
+    lv_obj_set_style_text_font(*out_pct, L.ent_pct_font, 0);   // serif headline number
     lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
     lv_obj_set_pos(*out_pct, 0, 0);
 
@@ -515,6 +612,15 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_pos(lbl_spending_desc, 0, L.usage_reset_y);
     lv_obj_add_flag(lbl_spending_desc, LV_OBJ_FLAG_HIDDEN);
 
+    lbl_spending_today = lv_label_create(panel_session);
+    lv_label_set_text(lbl_spending_today, "");
+    lv_obj_set_style_text_font(lbl_spending_today, L.today_font, 0);
+    lv_obj_set_style_text_color(lbl_spending_today, COL_ACCENT, 0);
+    // Smaller face than the dollar line: drop it a few px so the baselines meet.
+    lv_obj_align(lbl_spending_today, LV_ALIGN_TOP_RIGHT, 0,
+                 L.usage_reset_y + (lv_font_get_line_height(L.reset_font) - lv_font_get_line_height(L.today_font)) * 3 / 4);
+    lv_obj_add_flag(lbl_spending_today, LV_OBJ_FLAG_HIDDEN);
+
     lbl_spending_status = lv_label_create(panel_session);
     lv_label_set_text(lbl_spending_status, "");
     lv_obj_set_style_text_font(lbl_spending_status, L.pace_font, 0);
@@ -528,15 +634,620 @@ static void init_usage_screen(lv_obj_t* scr) {
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
+    build_spark(panel_weekly);
+
+    lbl_weekly_pct_sym = lv_label_create(panel_weekly);
+    lv_label_set_text(lbl_weekly_pct_sym, "%");
+    lv_obj_set_style_text_font(lbl_weekly_pct_sym, L.reset_font, 0);
+    lv_obj_set_style_text_color(lbl_weekly_pct_sym, COL_TEXT, 0);
+    lv_obj_add_flag(lbl_weekly_pct_sym, LV_OBJ_FLAG_HIDDEN);
+
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
-    lbl_anim = lv_label_create(usage_container);
+    // Text in the geometric face; the spinner glyph keeps the mono font because
+    // Styrene has no dingbats. A flex row keeps the pair centered as one unit.
+    anim_row = lv_obj_create(usage_container);
+    lv_obj_set_size(anim_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(anim_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(anim_row, 0, 0);
+    lv_obj_set_style_pad_all(anim_row, 0, 0);
+    lv_obj_set_style_pad_column(anim_row, L.small_icons ? 6 : 10, 0);
+    lv_obj_set_flex_flow(anim_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(anim_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(anim_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(anim_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(anim_row, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_align(anim_row, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
+
+    lbl_anim_glyph = lv_label_create(anim_row);
+    lv_label_set_text(lbl_anim_glyph, "");
+    lv_obj_set_style_text_font(lbl_anim_glyph, L.anim_glyph_font, 0);
+    lv_obj_set_style_text_color(lbl_anim_glyph, COL_ACCENT, 0);
+
+    lbl_anim = lv_label_create(anim_row);
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, L.anim_font, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
-    lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
+
+    build_attention(usage_container);
+    build_approval(usage_container);
+}
+
+// ======== Claude Code approval prompt ========
+//
+// The daemon forwards a pending Claude Code permission request ("ai" id,
+// "at" title, "ad" detail) only when the whole request fits on this screen.
+// Tapping Allow/Deny notifies "A<id>:1|0" back to the daemon, which hands the
+// answer to the waiting PermissionRequest hook. When the request goes away on
+// the host side (answered at the keyboard, or timed out) the daemon sends
+// ai=0 and the prompt closes. Touch only: the side buttons stay HID keys so a
+// stray press can never approve anything.
+static lv_obj_t* ap_box = nullptr;
+static lv_obj_t* ap_title = nullptr;
+static lv_obj_t* ap_detail = nullptr;
+static uint32_t  ap_shown_id = 0;      // request currently on screen
+static uint32_t  ap_answered_id = 0;   // answered here; ignore until the host clears it
+static bool      ap_visible = false;
+static bool      att_visible = false;       // attention screen (defined further down)
+static screen_t  ap_prev_screen = SCREEN_USAGE;
+
+static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
+                                const char* text, lv_color_t bg, lv_color_t fg, bool allow);
+
+static void ap_button_cb(lv_event_t* e) {
+    bool allow = (bool)(uintptr_t)lv_event_get_user_data(e);
+    if (!ap_visible || ap_shown_id == 0) return;
+    ble_send_approval(ap_shown_id, allow);
+    ap_answered_id = ap_shown_id;
+    strlcpy(s_cc_status, allow ? "Allowed" : "Denied", sizeof(s_cc_status));
+    approval_hide();
+}
+
+static lv_obj_t* make_ap_button(lv_obj_t* parent, int x, int y, int w, int h,
+                                const char* text, lv_color_t bg, lv_color_t fg, bool allow) {
+    lv_obj_t* b = lv_obj_create(parent);
+    lv_obj_set_pos(b, x, y);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_style_bg_color(b, bg, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_70, LV_STATE_PRESSED);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(b, ap_button_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)allow);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, L.pct_font, 0);
+    lv_obj_set_style_text_color(l, fg, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void build_approval(lv_obj_t* parent) {
+    const int gap = L.small_icons ? 8 : 16;
+    const int btn_h = L.small_icons ? 50 : 100;
+    const int btn_w = (L.content_w - gap) / 2;
+    const int btn_y = L.scr_h - L.margin - btn_h;
+    const int top = L.small_icons ? 6 : L.title_y + 10;
+    const int title_y = top + (L.small_icons ? 20 : 44);
+    const int panel_y = title_y + (L.small_icons ? 34 : 66);
+    const int panel_h = btn_y - panel_y - (L.small_icons ? 26 : 48);
+
+    ap_box = lv_obj_create(parent);
+    lv_obj_set_pos(ap_box, 0, 0);
+    lv_obj_set_size(ap_box, L.scr_w, L.scr_h);
+    lv_obj_set_style_bg_color(ap_box, COL_BG, 0);
+    lv_obj_set_style_bg_opa(ap_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ap_box, 0, 0);
+    lv_obj_set_style_pad_all(ap_box, 0, 0);
+    lv_obj_set_style_radius(ap_box, 0, 0);
+    lv_obj_clear_flag(ap_box, LV_OBJ_FLAG_SCROLLABLE);   // stays clickable: swallows stray taps
+
+    lv_obj_t* kicker = lv_label_create(ap_box);
+    lv_label_set_text(kicker, "Claude Code wants to");
+    lv_obj_set_style_text_font(kicker, L.reset_font, 0);
+    lv_obj_set_style_text_color(kicker, COL_DIM, 0);
+    lv_obj_align(kicker, LV_ALIGN_TOP_MID, 0, top);
+
+    ap_title = lv_label_create(ap_box);
+    lv_label_set_text(ap_title, "");
+    lv_obj_set_style_text_font(ap_title, L.pct_font, 0);
+    lv_obj_set_style_text_color(ap_title, COL_ACCENT, 0);
+    lv_obj_align(ap_title, LV_ALIGN_TOP_MID, 0, title_y);
+
+    lv_obj_t* panel = make_panel(ap_box, L.margin, panel_y, L.content_w, panel_h);
+    ap_detail = lv_label_create(panel);
+    lv_label_set_text(ap_detail, "");
+    lv_obj_set_style_text_font(ap_detail, L.reset_font, 0);
+    lv_obj_set_style_text_color(ap_detail, COL_TEXT, 0);
+    lv_label_set_long_mode(ap_detail, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(ap_detail, L.content_w - 2 * L.panel_pad_x, panel_h - 2 * L.panel_pad_y);
+    lv_obj_set_pos(ap_detail, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(ap_box);
+    lv_label_set_text(hint, "or answer at your keyboard");
+    lv_obj_set_style_text_font(hint, L.pace_font, 0);
+    lv_obj_set_style_text_color(hint, COL_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, panel_y + panel_h + (L.small_icons ? 6 : 14));
+
+    make_ap_button(ap_box, L.margin, btn_y, btn_w, btn_h, "Deny", COL_PANEL, COL_TEXT, false);
+    make_ap_button(ap_box, L.margin + btn_w + gap, btn_y, btn_w, btn_h, "Allow", COL_GREEN, COL_TEXT, true);
+
+    lv_obj_add_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void approval_hide(void) {
+    if (!ap_box || !ap_visible) return;
+    lv_obj_add_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
+    ap_visible = false;
+    ap_shown_id = 0;
+    if (ap_prev_screen == SCREEN_SPLASH && current_screen != SCREEN_SPLASH && !att_visible) {
+        ui_show_screen(SCREEN_SPLASH);   // go back to where the user was
+    }
+}
+
+static void approval_update(const UsageData* data) {
+    if (!ap_box) return;
+    if (data->ap_id == 0) {              // host has no pending request
+        ap_answered_id = 0;
+        approval_hide();
+        return;
+    }
+    if (data->ap_id == ap_answered_id) return;           // answered here, awaiting clear
+    if (ap_visible && data->ap_id == ap_shown_id) return; // already showing it
+
+    lv_label_set_text(ap_title, data->ap_title[0] ? data->ap_title : "Use a tool");
+    lv_label_set_text(ap_detail, data->ap_detail);
+    ap_shown_id = data->ap_id;
+    if (!ap_visible) ap_prev_screen = current_screen;
+    if (current_screen != SCREEN_USAGE) ui_show_screen(SCREEN_USAGE);
+    lv_obj_clear_flag(ap_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ap_box);
+    ap_visible = true;
+    idle_note_activity();                // wake the panel for it
+    Serial.printf("approval: showing %lu (%s)\n", (unsigned long)ap_shown_id, data->ap_title);
+}
+
+bool ui_approval_active(void) {
+    return ap_visible;
+}
+
+// ======== Attention screen ("Claude needs you" / "Your turn" / "All done!") ========
+//
+// Shown when Claude Code is blocked on you (a permission prompt that didn't go
+// to the touch approval) or has just finished a long turn. Borrows the idle
+// screen's mini Clawd. Tap anywhere to dismiss; the host clears it on its own
+// when you answer at the keyboard or start the next prompt.
+static lv_obj_t* att_box = nullptr;
+static lv_obj_t* att_title = nullptr;
+static lv_obj_t* att_sub = nullptr;
+static lv_obj_t* att_sprite_slot = nullptr;   // where the mini Clawd sits on this screen
+static uint8_t   att_kind = 0;
+static uint16_t  att_seq_shown = 0, att_seq_dismissed = 0xFFFF;
+static int32_t   att_secs = -1;
+static uint32_t  att_rx_ms = 0;
+static screen_t  att_prev_screen = SCREEN_USAGE;
+static char      att_project[24] = "";
+static lv_obj_t* att_sprite_home = nullptr;   // the mini's normal parent (idle screen)
+
+static void fmt_dur(char* out, size_t n, int32_t secs) {
+    if (secs < 0) { out[0] = '\0'; return; }
+    if (secs >= 3600) snprintf(out, n, "%ld:%02ld:%02ld", (long)(secs / 3600), (long)(secs / 60 % 60), (long)(secs % 60));
+    else              snprintf(out, n, "%ld:%02ld", (long)(secs / 60), (long)(secs % 60));
+}
+
+static void attention_refresh_sub(void) {
+    if (!att_sub) return;
+    char d[16], line[64];
+    if (att_kind == 1) {
+        int32_t waited = att_secs < 0 ? -1 : att_secs + (int32_t)((millis() - att_rx_ms) / 1000);
+        fmt_dur(d, sizeof(d), waited);
+        if (att_project[0]) snprintf(line, sizeof(line), "%s - waiting %s", att_project, d);
+        else                snprintf(line, sizeof(line), "waiting %s", d);
+    } else {
+        fmt_dur(d, sizeof(d), att_secs);
+        if (att_project[0] && d[0]) snprintf(line, sizeof(line), "%s - took %s", att_project, d);
+        else if (d[0])              snprintf(line, sizeof(line), "took %s", d);
+        else                        strlcpy(line, att_project, sizeof(line));
+    }
+    lv_label_set_text(att_sub, line);
+}
+
+static void attention_hide(bool by_tap) {
+    if (!att_visible) return;
+    att_visible = false;
+    if (by_tap) att_seq_dismissed = att_seq_shown;
+    lv_obj_add_flag(att_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t* mini = splash_mini_obj();
+    if (mini && att_sprite_home) {
+        lv_obj_set_parent(mini, att_sprite_home);
+        lv_obj_align(mini, LV_ALIGN_CENTER, 0, -20);
+        splash_mini_set_anim("expression sleep");
+    }
+    if (att_prev_screen != SCREEN_USAGE && !ap_visible) ui_show_screen(att_prev_screen);
+}
+
+static void att_click_cb(lv_event_t* e) {
+    (void)e;
+    attention_hide(true);
+}
+
+static void build_attention(lv_obj_t* parent) {
+    att_box = lv_obj_create(parent);
+    lv_obj_set_pos(att_box, 0, 0);
+    lv_obj_set_size(att_box, L.scr_w, L.scr_h);
+    lv_obj_set_style_bg_color(att_box, COL_BG, 0);
+    lv_obj_set_style_bg_opa(att_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(att_box, 0, 0);
+    lv_obj_set_style_pad_all(att_box, 0, 0);
+    lv_obj_set_style_radius(att_box, 0, 0);
+    lv_obj_clear_flag(att_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(att_box, att_click_cb, LV_EVENT_CLICKED, NULL);
+
+    att_sprite_slot = lv_obj_create(att_box);           // invisible anchor for the mini Clawd
+    lv_obj_set_size(att_sprite_slot, L.idle_px, L.idle_px);
+    lv_obj_set_style_bg_opa(att_sprite_slot, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(att_sprite_slot, 0, 0);
+    lv_obj_set_style_pad_all(att_sprite_slot, 0, 0);
+    lv_obj_clear_flag(att_sprite_slot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(att_sprite_slot, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_align(att_sprite_slot, LV_ALIGN_TOP_MID, 0, L.small_icons ? 20 : 60);
+
+    att_title = lv_label_create(att_box);
+    lv_label_set_text(att_title, "");
+    lv_obj_set_style_text_font(att_title, L.pct_font, 0);
+    lv_obj_set_style_text_color(att_title, COL_ACCENT, 0);
+    lv_obj_align(att_title, LV_ALIGN_TOP_MID, 0, (L.small_icons ? 20 : 60) + L.idle_px + (L.small_icons ? 8 : 20));
+
+    att_sub = lv_label_create(att_box);
+    lv_label_set_text(att_sub, "");
+    lv_obj_set_style_text_font(att_sub, L.reset_font, 0);
+    lv_obj_set_style_text_color(att_sub, COL_TEXT, 0);
+    lv_obj_align_to(att_sub, att_title, LV_ALIGN_OUT_BOTTOM_MID, 0, L.small_icons ? 4 : 14);
+
+    lv_obj_t* hint = lv_label_create(att_box);
+    lv_label_set_text(hint, "tap to dismiss");
+    lv_obj_set_style_text_font(hint, L.pace_font, 0);
+    lv_obj_set_style_text_color(hint, COL_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, L.small_icons ? -8 : -24);
+
+    lv_obj_add_flag(att_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void attention_update(const UsageData* data) {
+    if (!att_box) return;
+    if (data->att == 0) { attention_hide(false); att_kind = 0; return; }
+    if (data->att_seq == att_seq_dismissed) return;            // dismissed by a tap
+    bool fresh = !att_visible || data->att_seq != att_seq_shown || data->att != att_kind;
+    att_kind = data->att;
+    att_seq_shown = data->att_seq;
+    att_secs = data->att_secs;
+    att_rx_ms = data->att_rx_ms;
+    strlcpy(att_project, data->att_project, sizeof(att_project));
+    if (!fresh) { attention_refresh_sub(); return; }
+
+    const char* title = "Claude needs you";
+    const char* anim  = "allow";
+    lv_color_t color  = COL_ACCENT;
+    if (att_kind == 2) { title = "Your turn";  anim = "done";         color = COL_TEXT; }
+    if (att_kind == 3) { title = "All done!";  anim = "dance bounce"; color = COL_GREEN; }
+    lv_label_set_text(att_title, title);
+    lv_obj_set_style_text_color(att_title, color, 0);
+    lv_obj_align(att_title, LV_ALIGN_TOP_MID, 0, (L.small_icons ? 20 : 60) + L.idle_px + (L.small_icons ? 8 : 20));
+    attention_refresh_sub();
+    lv_obj_align_to(att_sub, att_title, LV_ALIGN_OUT_BOTTOM_MID, 0, L.small_icons ? 4 : 14);
+
+    lv_obj_t* mini = splash_mini_obj();
+    if (mini) {
+        if (!att_sprite_home) att_sprite_home = lv_obj_get_parent(mini);
+        lv_obj_set_parent(mini, att_sprite_slot);
+        lv_obj_center(mini);
+        splash_mini_set_anim(anim);
+    }
+    if (!att_visible) att_prev_screen = current_screen;
+    if (current_screen != SCREEN_USAGE) ui_show_screen(SCREEN_USAGE);
+    lv_obj_clear_flag(att_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(att_box);
+    if (ap_visible && ap_box) lv_obj_move_foreground(ap_box);   // approval stays on top
+    att_visible = true;
+    idle_note_activity();
+    Serial.printf("attention: %u (%s)\n", (unsigned)att_kind, title);
+}
+
+static void attention_tick(void) {
+    if (!att_visible) return;
+    splash_mini_tick();
+    static uint32_t last = 0;
+    if (att_kind == 1 && millis() - last >= 1000) {   // the "waiting 0:42" counter
+        last = millis();
+        attention_refresh_sub();
+    }
+}
+
+bool ui_overlay_active(void) {
+    return ap_visible || att_visible;
+}
+
+// ======== Month chart in the Period panel (Enterprise) ========
+//
+// One column per day of the billing month, height = that day's Claude Code
+// spend relative to the busiest day. Days so far are drawn in the pace color
+// (today brightest); days still to come are short gray stubs, so the row also
+// shows how far into the month you are.
+#define SPARK_MAX 31
+static lv_obj_t* spark_box = nullptr;
+static lv_obj_t* spark_col[SPARK_MAX];
+static int16_t   spark_h = 0;
+
+static void build_spark(lv_obj_t* panel) {
+    int w = L.content_w - 2 * L.panel_pad_x;
+    spark_h = L.bar_h + (L.small_icons ? 4 : 12);
+    spark_box = lv_obj_create(panel);
+    lv_obj_set_size(spark_box, w, spark_h);
+    lv_obj_set_pos(spark_box, 0, L.usage_bar_y - (spark_h - L.bar_h) / 2);
+    lv_obj_set_style_bg_opa(spark_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(spark_box, 0, 0);
+    lv_obj_set_style_pad_all(spark_box, 0, 0);
+    lv_obj_clear_flag(spark_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(spark_box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(spark_box, LV_OBJ_FLAG_EVENT_BUBBLE);
+    for (int i = 0; i < SPARK_MAX; i++) {
+        spark_col[i] = lv_obj_create(spark_box);
+        lv_obj_set_style_border_width(spark_col[i], 0, 0);
+        lv_obj_set_style_pad_all(spark_col[i], 0, 0);
+        lv_obj_set_style_radius(spark_col[i], 2, 0);
+        lv_obj_clear_flag(spark_col[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(spark_col[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(spark_col[i], LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(spark_col[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(spark_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void spark_update(const UsageData* data, lv_color_t pace) {
+    if (!spark_box) return;
+    if (!data || !data->enterprise || !data->stats_valid || data->hist_n == 0) {
+        lv_obj_add_flag(spark_box, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_add_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(spark_box, LV_OBJ_FLAG_HIDDEN);
+    int n = data->hist_n > SPARK_MAX ? SPARK_MAX : data->hist_n;
+    int w = L.content_w - 2 * L.panel_pad_x;
+    int slot = w / n;
+    int gap = slot >= 8 ? 3 : 1;
+    int today = data->hist_today;
+    for (int i = 0; i < SPARK_MAX; i++) {
+        if (i >= n) { lv_obj_add_flag(spark_col[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        bool future = today >= 0 && i > today;
+        int h = future ? 3 : 3 + (spark_h - 3) * data->hist[i] / 100;
+        lv_obj_set_size(spark_col[i], slot - gap, h);
+        lv_obj_set_pos(spark_col[i], i * slot, spark_h - h);
+        lv_obj_set_style_bg_color(spark_col[i], future ? COL_BAR_BG : pace, 0);
+        lv_obj_set_style_bg_opa(spark_col[i], (future || i == today) ? LV_OPA_COVER : LV_OPA_60, 0);
+        lv_obj_clear_flag(spark_col[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// ======== Today screen (tap: splash -> usage -> today -> splash) ========
+static lv_obj_t* st_num[4];
+static lv_obj_t* st_foot = nullptr;
+
+static void init_stats_screen(lv_obj_t* scr) {
+    stats_container = lv_obj_create(scr);
+    lv_obj_set_size(stats_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(stats_container, 0, 0);
+    lv_obj_set_style_bg_color(stats_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(stats_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(stats_container, 0, 0);
+    lv_obj_set_style_pad_all(stats_container, 0, 0);
+    lv_obj_set_style_radius(stats_container, 0, 0);
+    lv_obj_clear_flag(stats_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(stats_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(stats_container);
+    lv_label_set_text(title, "Today");
+    lv_obj_set_style_text_font(title, L.title_font, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    static const char* labels[4] = {"tool calls", "files edited", "prompts", "approved here"};
+    const int gap = L.small_icons ? 6 : 16;
+    const int pw = (L.content_w - gap) / 2;
+    const int ph = L.small_icons ? 70 : 130;
+    for (int i = 0; i < 4; i++) {
+        int x = L.margin + (i % 2) * (pw + gap);
+        int y = L.content_y + (i / 2) * (ph + gap);
+        lv_obj_t* p = make_panel(stats_container, x, y, pw, ph);
+        lv_obj_add_flag(p, LV_OBJ_FLAG_EVENT_BUBBLE);
+        st_num[i] = lv_label_create(p);
+        lv_label_set_text(st_num[i], "--");
+        lv_obj_set_style_text_font(st_num[i], L.ent_pct_font, 0);
+        lv_obj_set_style_text_color(st_num[i], COL_TEXT, 0);
+        lv_obj_set_pos(st_num[i], 0, 0);
+        lv_obj_t* l = lv_label_create(p);
+        lv_label_set_text(l, labels[i]);
+        lv_obj_set_style_text_font(l, L.today_font, 0);
+        lv_obj_set_style_text_color(l, COL_DIM, 0);
+        lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+
+    st_foot = lv_label_create(stats_container);
+    lv_label_set_text(st_foot, "");
+    lv_obj_set_style_text_font(st_foot, L.reset_font, 0);
+    lv_obj_set_style_text_color(st_foot, COL_ACCENT, 0);
+    lv_obj_align(st_foot, LV_ALIGN_TOP_MID, 0, L.content_y + 2 * ph + gap + (L.small_icons ? 8 : 22));
+
+    lv_obj_add_flag(stats_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void stats_update(const UsageData* data) {
+    if (!stats_container || !data->stats_valid) return;
+    const int32_t v[4] = {data->k_tools, data->k_files, data->k_prompts, data->k_approvals};
+    for (int i = 0; i < 4; i++) {
+        if (v[i] < 0) lv_label_set_text(st_num[i], "--");
+        else          lv_label_set_text_fmt(st_num[i], "%ld", (long)v[i]);
+    }
+    char foot[64] = "";
+    if (data->k_minutes >= 0) {
+        long m = data->k_minutes;
+        if (m >= 60) snprintf(foot, sizeof(foot), "%ldh %02ldm with Claude", m / 60, m % 60);
+        else         snprintf(foot, sizeof(foot), "%ldm with Claude", m);
+    }
+    if (data->k_streak > 1) {
+        size_t n = strlen(foot);
+        snprintf(foot + n, sizeof(foot) - n, "%s%ld-day streak", n ? " - " : "", (long)data->k_streak);
+    }
+    lv_label_set_text(st_foot, foot);
+    lv_obj_align(st_foot, LV_ALIGN_TOP_MID, 0,
+                 L.content_y + 2 * (L.small_icons ? 70 : 130) + (L.small_icons ? 6 : 16) + (L.small_icons ? 8 : 22));
+}
+
+// ======== Max screen (tap: splash -> usage -> max -> today -> splash) ========
+// The personal Max plan, polled by the host with a second Claude Code login.
+// Same panels as the Pro/Max usage view, plus a thin marker on each bar showing
+// how far into the window you are: fill past the marker = ahead of pace.
+struct MaxPanel {
+    lv_obj_t* pct;
+    lv_obj_t* sym;
+    lv_obj_t* pill;
+    lv_obj_t* bar;
+    lv_obj_t* reset;
+    lv_obj_t* tick;
+};
+static MaxPanel mx[2];
+static lv_obj_t* mx_foot = nullptr;
+static uint32_t  mx_last_rx = 0;
+static int       mx_foot_min = -2;          // last minute value the footer was drawn for
+static uint8_t   mx_err = 0;
+static int16_t   mx_m = -1;
+static char      mx_mn[12] = "";
+
+static void init_max_screen(lv_obj_t* scr) {
+    max_container = lv_obj_create(scr);
+    lv_obj_set_size(max_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(max_container, 0, 0);
+    lv_obj_set_style_bg_color(max_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(max_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(max_container, 0, 0);
+    lv_obj_set_style_pad_all(max_container, 0, 0);
+    lv_obj_set_style_radius(max_container, 0, 0);
+    lv_obj_clear_flag(max_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(max_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(max_container);
+    lv_label_set_text(title, "Max");
+    lv_obj_set_style_text_font(title, L.title_font, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    static const char* pills[2] = {"Current", "Weekly"};
+    for (int i = 0; i < 2; i++) {
+        int y = L.content_y + i * (L.usage_panel_h + L.usage_panel_gap);
+        lv_obj_t* p = make_usage_panel(max_container, y, pills[i],
+                                       &mx[i].pct, &mx[i].pill, &mx[i].bar, &mx[i].reset);
+        mx[i].sym = lv_label_create(p);
+        lv_label_set_text(mx[i].sym, "%");
+        lv_obj_set_style_text_font(mx[i].sym, L.reset_font, 0);
+        lv_obj_set_style_text_color(mx[i].sym, COL_TEXT, 0);
+        lv_obj_add_flag(mx[i].sym, LV_OBJ_FLAG_HIDDEN);
+
+        mx[i].tick = lv_obj_create(p);           // pace marker, drawn over the bar
+        lv_obj_set_size(mx[i].tick, 3, L.bar_h + 10);
+        lv_obj_set_style_bg_color(mx[i].tick, COL_TEXT, 0);
+        lv_obj_set_style_bg_opa(mx[i].tick, LV_OPA_80, 0);
+        lv_obj_set_style_border_width(mx[i].tick, 0, 0);
+        lv_obj_set_style_radius(mx[i].tick, 1, 0);
+        lv_obj_set_style_pad_all(mx[i].tick, 0, 0);
+        lv_obj_clear_flag(mx[i].tick, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(mx[i].tick, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(mx[i].tick, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    mx_foot = lv_label_create(max_container);
+    lv_label_set_text(mx_foot, "");
+    lv_obj_set_style_text_font(mx_foot, L.today_font, 0);
+    lv_obj_set_style_text_color(mx_foot, COL_DIM, 0);
+    lv_obj_align(mx_foot, LV_ALIGN_TOP_MID, 0,
+                 L.content_y + 2 * L.usage_panel_h + L.usage_panel_gap + (L.small_icons ? 4 : 16));
+
+    lv_obj_add_flag(max_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// One panel: number + "%", colored bar, reset line, pace marker at
+// (window - mins_left) / window along the bar.
+static void max_panel_set(MaxPanel& m, bool ok, float pct, int reset_mins, int window_mins) {
+    char buf[40];
+    if (!ok) {
+        lv_label_set_text(m.pct, "--");
+        lv_obj_add_flag(m.sym, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(m.bar, 0, LV_ANIM_OFF);
+        lv_label_set_text(m.reset, "---");
+        lv_obj_add_flag(m.tick, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    int p = (int)(pct + 0.5f);
+    if (p > 100) p = 100;
+    lv_label_set_text_fmt(m.pct, "%d", p);
+    lv_obj_clear_flag(m.sym, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align_to(m.sym, m.pct, LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
+    lv_bar_set_value(m.bar, p, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(m.bar, pct_color(pct), LV_PART_INDICATOR);
+    format_reset_time(reset_mins, buf, sizeof(buf));
+    lv_label_set_text(m.reset, buf);
+    if (reset_mins >= 0 && reset_mins <= window_mins) {
+        const int bar_w = L.content_w - 2 * L.panel_pad_x;
+        int x = (int)((long)bar_w * (window_mins - reset_mins) / window_mins);
+        if (x < 2) x = 2;
+        if (x > bar_w - 2) x = bar_w - 2;
+        lv_obj_set_pos(m.tick, x - 1, L.usage_bar_y - 5);
+        lv_obj_clear_flag(m.tick, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(m.tick, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void max_update(const UsageData* data) {
+    if (!max_container || !data->max_valid || data->max_rx_ms == mx_last_rx) return;
+    mx_last_rx = data->max_rx_ms;
+    s_max_seen = true;
+    mx_err = data->max_err;
+    mx_m = data->max_m;
+    strlcpy(mx_mn, data->max_mn, sizeof(mx_mn));
+    bool ok = data->max_err == 0;
+    max_panel_set(mx[0], ok, data->max_s, data->max_sr, 300);       // 5-hour window
+    max_panel_set(mx[1], ok, data->max_w, data->max_wr, 7 * 1440);  // 7-day window
+    mx_foot_min = -2;   // redraw the footer on the next tick
+    max_tick();
+}
+
+// Footer: errors first, then staleness, then the optional per-model limit.
+// Only relabels when the minute-age bucket changes.
+static void max_tick(void) {
+    if (!mx_foot || !s_max_seen) return;
+    int age_min = (int)((millis() - mx_last_rx) / 60000);
+    int bucket = age_min >= 5 ? age_min : -1;
+    if (bucket == mx_foot_min) return;
+    mx_foot_min = bucket;
+    char buf[48];
+    lv_color_t col = COL_DIM;
+    if (mx_err == 1)      { strlcpy(buf, "Not signed in - run connect-max", sizeof(buf)); col = COL_AMBER; }
+    else if (mx_err == 2) { strlcpy(buf, "Sign-in expired - run connect-max", sizeof(buf)); col = COL_AMBER; }
+    else if (mx_err == 3) { strlcpy(buf, "Can't reach Claude - retrying", sizeof(buf)); }
+    else if (bucket >= 0) {
+        if (age_min >= 60) snprintf(buf, sizeof(buf), "No update for %dh %dm", age_min / 60, age_min % 60);
+        else               snprintf(buf, sizeof(buf), "No update for %dm", age_min);
+        col = COL_AMBER;
+    }
+    else if (mx_m >= 0)   snprintf(buf, sizeof(buf), "%s only: %d%% this week", mx_mn[0] ? mx_mn : "Model", (int)mx_m);
+    else                  strlcpy(buf, "Personal plan - all Claude apps", sizeof(buf));
+    lv_label_set_text(mx_foot, buf);
+    lv_obj_set_style_text_color(mx_foot, col, 0);
+    lv_obj_align(mx_foot, LV_ALIGN_TOP_MID, 0,
+                 L.content_y + 2 * L.usage_panel_h + L.usage_panel_gap + (L.small_icons ? 4 : 16));
 }
 
 // ======== Public API ========
@@ -553,6 +1264,8 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_stats_screen(scr);
+    init_max_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -578,9 +1291,42 @@ void ui_init(void) {
 }
 
 void ui_update(const UsageData* data) {
+    max_update(data);               // its own message kind; may land before the first usage
     if (!data->valid) return;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
+
+    s_cc_live = data->cc_live;
+    strlcpy(s_cc_status, data->cc_status, sizeof(s_cc_status));
+    s_turn_start_ms = data->turn_start_ms;
+    strlcpy(s_project, data->project, sizeof(s_project));
+    s_sessions = data->sessions;
+    stats_update(data);
+    logo_anim_apply(logo_wanted_mode());
+
+    // Enterprise: show real dollars under the Spending % when the host knows them.
+    if (lbl_spending_desc) {
+        char dbuf[40];
+        long cents = lroundf(data->spent_usd * 100.0f);
+        if (data->spent_usd >= 0.0f && data->limit_usd > 0.0f) {
+            snprintf(dbuf, sizeof(dbuf), "$%ld.%02ld / $%d",
+                     cents / 100, cents % 100, (int)(data->limit_usd + 0.5f));
+        } else if (data->spent_usd >= 0.0f) {
+            snprintf(dbuf, sizeof(dbuf), "$%ld.%02ld this period", cents / 100, cents % 100);
+        } else {
+            strlcpy(dbuf, "of your monthly budget", sizeof(dbuf));
+        }
+        lv_label_set_text(lbl_spending_desc, dbuf);
+    }
+    if (lbl_spending_today) {
+        if (data->enterprise && data->today_usd >= 0.0f) {
+            long tc = lroundf(data->today_usd * 100.0f);
+            lv_label_set_text_fmt(lbl_spending_today, "$%ld.%02ld today", tc / 100, tc % 100);
+            lv_obj_clear_flag(lbl_spending_today, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(lbl_spending_today, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
@@ -595,19 +1341,15 @@ void ui_update(const UsageData* data) {
     int s_pct = (int)(data->session_pct + 0.5f);
 
     if (data->enterprise) {
-        // Spending box: big number-only label + small "%" symbol + desc + pace
-        lv_obj_set_style_text_font(lbl_session_pct, L.ent_pct_font, 0);
+        // Spending box: serif number + small "%" symbol + desc + pace
         lv_label_set_text(lbl_session_label, "Spending");
         lv_obj_add_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status,   LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
         lv_label_set_text(lbl_session_label, "Current");
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
@@ -625,12 +1367,17 @@ void ui_update(const UsageData* data) {
         pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "d97757";
     }
 
+    // Both headline numbers: serif digits with a small geometric "%" beside them.
     if (data->enterprise) {
-        lv_label_set_text_fmt(lbl_session_pct, "%d", s_pct);
-        lv_obj_align_to(lbl_session_pct_sym, lbl_session_pct,
-                        LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
+        // Live spend estimate: one decimal (tenths as integers, no float printf).
+        int tenths = (int)lroundf(data->session_pct * 10.0f);
+        lv_label_set_text_fmt(lbl_session_pct, "%d.%d", tenths / 10, tenths % 10);
     } else {
-        lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
+        lv_label_set_text_fmt(lbl_session_pct, "%d", s_pct);
+    }
+    lv_obj_clear_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align_to(lbl_session_pct_sym, lbl_session_pct, LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
+    if (!data->enterprise) {
         format_reset_time(data->session_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_session_reset, buf);
     }
@@ -641,23 +1388,30 @@ void ui_update(const UsageData* data) {
     if (data->enterprise) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
-        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
+        lv_label_set_text_fmt(lbl_weekly_pct, "%d", data->time_pct);
         lv_bar_set_value(bar_weekly, data->time_pct, LV_ANIM_ON);
         lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? COL_GREEN :
                               (data->session_pct <= (float)data->time_pct + 15.0f) ? COL_AMBER :
                               COL_RED;
         lv_obj_set_style_bg_color(bar_weekly, bar_pace, LV_PART_INDICATOR);
+        spark_update(data, bar_pace);
         snprintf(buf, sizeof(buf), "#%s %s# - #faf9f5 Resets %s#",
                  pace_hex, pace_text, data->reset_date);
         lv_label_set_text(lbl_weekly_reset, buf);
     } else {
         int w_pct = (int)(data->weekly_pct + 0.5f);
-        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
+        lv_label_set_text_fmt(lbl_weekly_pct, "%d", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
         lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+        spark_update(nullptr, COL_GREEN);   // Pro/Max: keep the plain bar
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_weekly_reset, buf);
     }
+    lv_obj_clear_flag(lbl_weekly_pct_sym, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align_to(lbl_weekly_pct_sym, lbl_weekly_pct, LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
+
+    attention_update(data);
+    approval_update(data);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -683,7 +1437,20 @@ static void update_view_state(void) {
                       LV_OBJ_FLAG_HIDDEN);
 }
 
+static uint32_t flash_until = 0;          // ui_flash_splash()/ui_toast(): when to go back
+static screen_t flash_prev = SCREEN_USAGE;
+static screen_t flash_shown = SCREEN_SPLASH;
+static uint32_t toast_until = 0;
+static char     toast_text[32] = "";
+
 void ui_tick_anim(void) {
+    if (flash_until && (int32_t)(lv_tick_get() - flash_until) >= 0) {
+        flash_until = 0;
+        if (current_screen == flash_shown && flash_prev != flash_shown && !ui_overlay_active())
+            ui_show_screen(flash_prev);
+    }
+    attention_tick();
+    if (current_screen == SCREEN_MAX) max_tick();
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
@@ -696,7 +1463,14 @@ void ui_tick_anim(void) {
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
-        if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
+        // Alternate the clock with the "Usage" title every 6 s; only touch the
+        // label when what it shows actually changes.
+        static int title_phase = -1;
+        int phase = (int)((now / 6000) % 2);
+        if (phase == 1) {
+            if (title_phase != 1) { lv_label_set_text(lbl_title, "Usage"); title_phase = 1; }
+        } else if (tmv.tm_min != clock_last_min || title_phase != 0) {
+            title_phase = 0;
             clock_last_min = tmv.tm_min;
             char tbuf[12];
             if (clock_fmt == 12) {
@@ -730,15 +1504,40 @@ void ui_tick_anim(void) {
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
     } else if (now - connected_at_ms < 5000) {
         text = "Connected";
+    } else if (toast_until && (int32_t)(now - toast_until) < 0) {
+        set_status_line(spinner_frames[0], toast_text);  // e.g. "Sound: medium"
+        return;
+    } else if (s_cc_live) {
+        // Real Claude Code state from the host's hooks. The host appends "…" to
+        // states that are in progress; settled ones (Done, Idle, Needs you) get a
+        // still glyph instead of the spinner so the line doesn't look busy.
+        // While busy the line also carries the turn timer; every other 4 s
+        // slot it shows which project (and how many other sessions) instead.
+        const char* st = s_cc_status[0] ? s_cc_status : "Idle";
+        bool busy = strstr(st, "\xE2\x80\xA6") != NULL;
+        static char line[48];
+        if ((anim_msg_idx & 1) && s_project[0]) {
+            if (s_sessions > 1) snprintf(line, sizeof(line), "%s +%u", s_project, (unsigned)(s_sessions - 1));
+            else                strlcpy(line, s_project, sizeof(line));
+        } else if (busy && s_turn_start_ms) {
+            uint32_t secs = (millis() - s_turn_start_ms) / 1000;
+            if (secs >= 3600) snprintf(line, sizeof(line), "%s %lu:%02lu:%02lu", st,
+                                       (unsigned long)(secs / 3600), (unsigned long)(secs / 60 % 60), (unsigned long)(secs % 60));
+            else              snprintf(line, sizeof(line), "%s %lu:%02lu", st,
+                                       (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+        } else {
+            strlcpy(line, st, sizeof(line));
+        }
+        set_status_line(busy ? spinner_frames[anim_spinner_idx] : spinner_frames[0], line);
+        return;
     } else {
         text = anim_messages[anim_msg_idx];
     }
 
-    // All states share the whimsical style: "<glyph> <Title-case word>…"
-    static char buf[80];
-    snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
-             spinner_frames[anim_spinner_idx], text);
-    lv_label_set_text(lbl_anim, buf);
+    // All states share the whimsical style: "<glyph> <Title-case word>..."
+    static char buf[48];
+    snprintf(buf, sizeof(buf), "%s...", text);
+    set_status_line(spinner_frames[anim_spinner_idx], buf);
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
@@ -750,17 +1549,50 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    if (ui_overlay_active()) return;     // never flip screens under a prompt
+    flash_until = 0;
+    if (current_screen == SCREEN_SPLASH)     ui_show_screen(SCREEN_USAGE);
+    else if (current_screen == SCREEN_USAGE) ui_show_screen(s_max_seen ? SCREEN_MAX : SCREEN_STATS);
+    else if (current_screen == SCREEN_MAX)   ui_show_screen(SCREEN_STATS);
+    else                                     ui_show_screen(SCREEN_SPLASH);
+}
+
+void ui_flash_splash(const char* anim, uint32_t ms) {
+    if (ui_overlay_active()) return;
+    if (current_screen != SCREEN_SPLASH) {
+        flash_prev = current_screen;
+        flash_shown = SCREEN_SPLASH;
+        flash_until = lv_tick_get() + ms;
+        ui_show_screen(SCREEN_SPLASH);
+    }
+    splash_play_temp(anim, ms);
+}
+
+void ui_toast(const char* text, uint32_t ms) {
+    strlcpy(toast_text, text, sizeof(toast_text));
+    toast_until = lv_tick_get() + ms;
+    if (ui_overlay_active()) return;
+    if (current_screen != SCREEN_USAGE) {
+        if (!flash_until) flash_prev = current_screen;   // keep the original screen on repeats
+        flash_shown = SCREEN_USAGE;
+        flash_until = lv_tick_get() + ms;
+        ui_show_screen(SCREEN_USAGE);
+    } else if (flash_until && flash_shown == SCREEN_USAGE) {
+        flash_until = lv_tick_get() + ms;               // repeated presses extend the toast
+    }
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    if (stats_container) lv_obj_add_flag(stats_container, LV_OBJ_FLAG_HIDDEN);
+    if (max_container) lv_obj_add_flag(max_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_MAX:     if (max_container) lv_obj_clear_flag(max_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_STATS:   if (stats_container) lv_obj_clear_flag(stats_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -772,6 +1604,7 @@ void ui_show_screen(screen_t screen) {
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
+    logo_anim_apply(logo_wanted_mode());
 }
 
 void ui_toggle_splash(void) {
@@ -789,6 +1622,7 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     s_ble_connected = (state == BLE_STATE_CONNECTED);
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    if (!s_ble_connected) approval_hide();   // can't answer without a link
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
 }

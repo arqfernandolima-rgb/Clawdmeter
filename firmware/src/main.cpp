@@ -9,6 +9,8 @@
 #include "ble.h"
 #include "splash.h"
 #include "charge_anim.h"
+#include "motion.h"
+#include "chime.h"
 #include "usage_rate.h"
 #include "idle.h"
 #include "idle_cfg.h"
@@ -105,13 +107,116 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+// ---- Speaker volume (right button hold) ----
+#define VOLUME_HOLD_MS 700
+static uint8_t  s_volume = 70;
+static uint32_t vol_local_ms = 0;
+
+static void volume_step(void) {
+    static const uint8_t levels[4] = {0, 45, 65, 85};
+    static const char* names[4] = {"Sound: off", "Sound: low", "Sound: medium", "Sound: high"};
+    int cur = 0, best = 1000;
+    for (int i = 0; i < 4; i++) {
+        int d = abs((int)levels[i] - (int)s_volume);
+        if (d < best) { best = d; cur = i; }
+    }
+    int nxt = (cur + 1) % 4;
+    s_volume = levels[nxt];
+    vol_local_ms = millis();
+    if (vol_local_ms == 0) vol_local_ms = 1;
+    sound_hal_set_volume(s_volume);
+    if (s_volume) sound_hal_play(CHIME_PREVIEW);   // hear the new level
+    ble_send_volume(s_volume);                     // host saves it to its config
+    ui_toast(names[nxt], 1800);
+    Serial.printf("volume -> %u\n", (unsigned)s_volume);
+}
+
+// Three message kinds keep every BLE write under the ~250-byte ATT MTU:
+//   usage  - the 60 s poll (numbers, clock, settings)       -> full refresh of usage fields
+//   status - "so":1, Claude Code state/approval/attention    -> only the keys present change
+//   stats  - "hs":1, month histogram + today's counters      -> stats fields only
+//   max    - "hm":1, the second (personal Max) account        -> max_* fields only
+enum msg_kind_t { MSG_BAD = -1, MSG_USAGE = 0, MSG_STATUS = 1, MSG_STATS = 2, MSG_MAX = 3 };
+
+static void parse_status_keys(JsonDocument& doc, UsageData* out) {
+    if (doc["cs"].is<const char*>()) {
+        out->cc_live = true;
+        strlcpy(out->cc_status, doc["cs"] | "", sizeof(out->cc_status));
+    }
+    if (doc["a"].is<const char*>())  strlcpy(out->anim, doc["a"] | "", sizeof(out->anim));
+    if (doc["tt"].is<int>()) {       // seconds into the turn at send time -> local start
+        int tt = doc["tt"] | -1;
+        out->turn_start_ms = tt >= 0 ? millis() - (uint32_t)tt * 1000u : 0;
+        if (tt >= 0 && out->turn_start_ms == 0) out->turn_start_ms = 1;
+    }
+    if (doc["pj"].is<const char*>()) strlcpy(out->project, doc["pj"] | "", sizeof(out->project));
+    if (doc["ns"].is<int>())         out->sessions = doc["ns"] | 0;
+    if (doc["att"].is<int>()) {
+        out->att = doc["att"] | 0;
+        out->att_seq = doc["aq"] | 0;
+        out->att_secs = doc["atd"] | -1;
+        out->att_rx_ms = millis();
+        strlcpy(out->att_project, doc["atp"] | "", sizeof(out->att_project));
+    }
+    if (doc["snd"].is<int>()) {
+        out->snd = doc["snd"] | 0;
+        out->snd_seq = doc["sq"] | 0;
+    }
+    if (doc["ai"].is<unsigned int>()) {
+        out->ap_id = doc["ai"] | 0u;
+        strlcpy(out->ap_title, doc["at"] | "", sizeof(out->ap_title));
+        strlcpy(out->ap_detail, doc["ad"] | "", sizeof(out->ap_detail));
+    }
+}
+
+static int parse_json(const char* json, UsageData* out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
+        return MSG_BAD;
+    }
+
+    if (doc["hs"].is<int>()) {                         // ---- stats
+        JsonArrayConst a = doc["dh"].as<JsonArrayConst>();
+        uint8_t n = 0;
+        for (JsonVariantConst v : a) {
+            if (n >= sizeof(out->hist)) break;
+            int x = v | 0;
+            out->hist[n++] = (uint8_t)(x < 0 ? 0 : (x > 100 ? 100 : x));
+        }
+        out->hist_n = n;
+        out->hist_today = doc["di"] | -1;
+        out->hist_max_usd = doc["dm"] | 0.0f;
+        out->k_tools = doc["kt"] | -1;
+        out->k_files = doc["kf"] | -1;
+        out->k_prompts = doc["kp"] | -1;
+        out->k_approvals = doc["ka"] | -1;
+        out->k_minutes = doc["km"] | -1;
+        out->k_streak = doc["kr"] | -1;
+        out->stats_valid = true;
+        out->status_only = true;
+        return MSG_STATS;
+    }
+    if (doc["hm"].is<int>()) {                         // ---- second account (Max)
+        out->max_err = doc["e"] | 0;
+        out->max_s   = doc["s"] | 0.0f;
+        out->max_sr  = doc["sr"] | -1;
+        out->max_w   = doc["w"] | 0.0f;
+        out->max_wr  = doc["wr"] | -1;
+        out->max_m   = doc["m"] | -1;
+        out->max_mr  = doc["mr"] | -1;
+        strlcpy(out->max_mn, doc["mn"] | "", sizeof(out->max_mn));
+        out->max_rx_ms = millis();
+        out->max_valid = true;
+        out->status_only = true;
+        return MSG_MAX;
+    }
+    if (doc["so"] | 0) {                               // ---- status (partial)
+        parse_status_keys(doc, out);
+        out->status_only = true;
+        out->valid = true;
+        return MSG_STATUS;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -125,12 +230,18 @@ static bool parse_json(const char* json, UsageData* out) {
     out->time_pct = doc["tp"] | 0;
     out->period_days = doc["pd"] | 30;
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
-    strlcpy(out->anim, doc["a"] | "", sizeof(out->anim));
+    out->spent_usd = doc["sd"] | -1.0f;
+    out->limit_usd = doc["sl"] | -1.0f;
+    out->today_usd = doc["td"] | -1.0f;
+    out->volume = doc["vol"] | 70;
+    out->facedown_sign = doc["fz"] | 1;
+    out->status_only = false;
+    parse_status_keys(doc, out);                       // tolerate status keys on usage too
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
     out->valid = true;
-    return true;
+    return MSG_USAGE;
 }
 
 // ---- Serial command buffer ----
@@ -313,6 +424,25 @@ void loop() {
     // is detected by the next tick after wake and ramped in then.
     if (!idle_is_asleep()) display_hal_tick();
 
+    // ---- Motion gestures (accelerometer) ----
+    motion_tick();
+    if (motion_take_dnd_change()) {
+        bool d = motion_dnd();
+        ble_send_dnd(d);                       // host routes approvals to the keyboard
+        Serial.printf("motion: %s\n", d ? "face-down, quiet" : "face-up again");
+        if (!d) { idle_note_activity(); sound_hal_play(CHIME_BLIP); }
+    }
+    if (motion_take_shake()) {
+        idle_note_activity();
+        if (!motion_dnd()) sound_hal_play(CHIME_BOING);
+        ui_flash_splash("expression surprise", 4000);
+    }
+    if (motion_take_pickup()) {
+        idle_note_activity();
+        if (!motion_dnd()) sound_hal_play(CHIME_BLIP);
+        if (ui_get_current_screen() == SCREEN_SPLASH) splash_play_temp("expression wink", 3000);
+    }
+
     // ---- Physical buttons ----
     //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
     //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
@@ -337,20 +467,33 @@ void loop() {
             primary_was = primary_now;
         }
 
+        // SECONDARY: a tap sends Shift+Tab (on release, so a hold can mean
+        // something else); holding ~0.7 s steps the speaker volume instead.
         if (board_caps().button_count >= 2) {
-            static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
+            static bool     secondary_was = false;
+            static bool     secondary_wake_swallowed = false;
+            static bool     secondary_long_done = false;
+            static uint32_t secondary_down_ms = 0;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
-            if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
-                }
-                secondary_was = secondary_now;
+            if (secondary_now && !secondary_was) {                 // pressed
+                secondary_wake_swallowed = idle_consume_wake_press();
+                secondary_down_ms = millis();
+                secondary_long_done = false;
             }
+            if (secondary_now && !secondary_wake_swallowed && !secondary_long_done
+                && millis() - secondary_down_ms >= VOLUME_HOLD_MS) {
+                secondary_long_done = true;
+                volume_step();
+            }
+            if (!secondary_now && secondary_was) {                 // released
+                if (!secondary_wake_swallowed && !secondary_long_done) {
+                    ble_keyboard_press(0x2B, 0x02);                // HID Tab + LEFT_SHIFT
+                    delay(15);
+                    ble_keyboard_release();
+                }
+                secondary_wake_swallowed = false;
+            }
+            secondary_was = secondary_now;
         }
 
         if (power_hal_pwr_pressed()) {
@@ -381,9 +524,9 @@ void loop() {
         const uint32_t now_ms = millis();
         const screen_t cur    = ui_get_current_screen();
 
-        if (idle_is_asleep()) {
+        if (idle_is_asleep() || ui_overlay_active()) {
             peek_ref_ms = now_ms;          // im Schlaf laeuft die Uhr nicht
-            peeking = false;
+            peeking = false;               // (and never flip away from an approval)
         } else if (peeking) {
             if (cur != SCREEN_USAGE) {     // Nutzer hat selbst umgeschaltet
                 peeking = false;
@@ -440,10 +583,31 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
+        int kind = parse_json(ble_get_data(), &usage);
+        if (kind != MSG_BAD) {
+            // Status/stats pushes arrive every few seconds; feeding them to the
+            // 5-minute rate ring would shrink its window, so only usage counts.
             int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
+            bool session_reset = (kind == MSG_USAGE) ? usage_rate_sample(usage.session_pct)
+                                                     : false;
             int g_after = usage_rate_group();
+            if (kind == MSG_USAGE) {
+                // The host's volume wins, except right after a local change
+                // (it takes the host a moment to save the new level).
+                if (vol_local_ms == 0 || millis() - vol_local_ms > 15000) {
+                    s_volume = usage.volume;
+                    sound_hal_set_volume(s_volume);
+                }
+                motion_set_facedown_sign(usage.facedown_sign);
+                if (motion_dnd()) ble_send_dnd(true);   // re-assert after a host restart
+            }
+            // Sound requests from the host: play once per sequence bump, never
+            // while the board lies face-down (do-not-disturb).
+            static uint16_t last_snd_seq = 0;
+            if (usage.snd_seq != last_snd_seq) {
+                last_snd_seq = usage.snd_seq;
+                if (usage.snd && !motion_dnd() && s_volume > 0) sound_hal_play(usage.snd);
+            }
             // 5-hour session limit refilled → chime so the user knows they can
             // use Claude again (no-op on boards without a buzzer). Gated on the
             // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
