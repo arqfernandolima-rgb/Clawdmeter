@@ -1,0 +1,91 @@
+# Clawdmeter -> Home Assistant: light up an Inovelli Blue LED bar when Claude needs you
+#
+# 1. Paste ONE of the two automations below into HA (Settings > Automations >
+#    Create > ... > Edit in YAML) and set your switch.
+# 2. Add this line to %LOCALAPPDATA%\Clawdmeter\config on the laptop:
+#      ha_webhook_url = http://homeassistant.local:8123/api/webhook/clawdmeter-CHANGE-ME
+#    (use your HA address if homeassistant.local doesn't resolve on that laptop)
+#
+# The daemon POSTs {"state": ..., "project": ..., "status": ...} whenever the
+# attention state changes. States:
+#   needs_you  - waiting on a permission prompt     -> orange pulse
+#   your_turn  - a turn of 1+ min just finished      -> green, 30 s
+#   celebrate  - a turn of 10+ min just finished     -> green aurora, 30 s
+#   busy/idle  - back to normal                      -> clear the effect
+#
+# The webhook only works while the laptop is on the home network. Effect names
+# and color numbers are the Inovelli Blue (VZM31-SN) ones; double-check them
+# against your device page if something doesn't light up.
+
+# ---------------------------------------------------------------------------
+# Option A: Zigbee2MQTT
+# ---------------------------------------------------------------------------
+alias: Clawdmeter - Inovelli LED (Z2M)
+mode: restart
+trigger:
+  - platform: webhook
+    webhook_id: clawdmeter-CHANGE-ME
+    allowed_methods: [POST]
+    local_only: true
+variables:
+  switch_topic: zigbee2mqtt/Office Switch/set      # <- your switch's friendly name
+  st: "{{ trigger.json.state }}"
+action:
+  - choose:
+      - conditions: "{{ st == 'needs_you' }}"
+        sequence:
+          - service: mqtt.publish
+            data:
+              topic: "{{ switch_topic }}"
+              payload: '{"led_effect": {"effect": "pulse", "color": 21, "level": 100, "duration": 255}}'
+      - conditions: "{{ st == 'your_turn' }}"
+        sequence:
+          - service: mqtt.publish
+            data:
+              topic: "{{ switch_topic }}"
+              payload: '{"led_effect": {"effect": "solid", "color": 85, "level": 100, "duration": 30}}'
+      - conditions: "{{ st == 'celebrate' }}"
+        sequence:
+          - service: mqtt.publish
+            data:
+              topic: "{{ switch_topic }}"
+              payload: '{"led_effect": {"effect": "aurora", "color": 85, "level": 100, "duration": 30}}'
+    default:
+      - service: mqtt.publish
+        data:
+          topic: "{{ switch_topic }}"
+          payload: '{"led_effect": {"effect": "clear_effect", "color": 0, "level": 0, "duration": 0}}'
+
+# ---------------------------------------------------------------------------
+# Option B: ZHA  (replace the ieee with your switch's, from its device page)
+# Inovelli cluster 64561, command 1 = LED effect, manufacturer code 4655.
+# effect: 1 solid, 4 pulse, 8 aurora, 255 clear   color: 21 orange, 85 green
+# ---------------------------------------------------------------------------
+# alias: Clawdmeter - Inovelli LED (ZHA)
+# mode: restart
+# trigger:
+#   - platform: webhook
+#     webhook_id: clawdmeter-CHANGE-ME
+#     allowed_methods: [POST]
+#     local_only: true
+# variables:
+#   ieee: "00:00:00:00:00:00:00:00"
+#   st: "{{ trigger.json.state }}"
+#   fx: "{{ {'needs_you': 4, 'your_turn': 1, 'celebrate': 8}.get(st, 255) }}"
+#   color: "{{ 21 if st == 'needs_you' else 85 }}"
+#   dur: "{{ 255 if st == 'needs_you' else 30 }}"
+# action:
+#   - service: zha.issue_zigbee_cluster_command
+#     data:
+#       ieee: "{{ ieee }}"
+#       endpoint_id: 1
+#       cluster_id: 64561
+#       cluster_type: in
+#       command: 1
+#       command_type: server
+#       manufacturer: 4655
+#       params:
+#         led_effect: "{{ fx | int }}"
+#         led_color: "{{ color | int }}"
+#         led_level: 100
+#         led_duration: "{{ dur | int }}"

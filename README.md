@@ -1,3 +1,10 @@
+> ### `fernando-mods` branch
+>
+> Builds on juppeee's `csb-buddy` below: live Claude Code status, a live spend
+> estimate, touchscreen approvals, attention screens with sound, a Today stats
+> screen, an optional second-account (Max plan) screen, motion gestures and a
+> sign-in keep-alive. See **[docs/fernando-mods.md](docs/fernando-mods.md)**.
+
 > ### This is a fork
 >
 > The Clawdmeter — the device, this firmware, the board ports, the LVGL work,
