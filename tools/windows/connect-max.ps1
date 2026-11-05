@@ -24,8 +24,11 @@ try {
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { throw "Can't find claude on PATH." }
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
-    if (Test-Path $Cred) {
-        Write-Host "A login already exists in $Dir - checking it." -ForegroundColor Cyan
+    # Newer Claude Code keeps the login in Windows Credential Manager, not a file,
+    # so ask the check script (it looks in both places) whether one exists.
+    & $VenvPy $Check $Dir *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "A login already exists for $Dir - checking it." -ForegroundColor Cyan
     } else {
         Write-Host ""
         Write-Host "Claude Code will open with a separate, empty profile:" -ForegroundColor Cyan
@@ -44,7 +47,8 @@ try {
             if ($old) { $env:CLAUDE_CONFIG_DIR = $old }
             else { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
         }
-        if (-not (Test-Path $Cred)) { throw "No login saved in $Dir. Run this again and finish the sign-in (/login)." }
+        & $VenvPy $Check $Dir *> $null
+        if ($LASTEXITCODE -eq 1) { throw "No login saved for $Dir. Run this again and finish the sign-in (/login)." }
     }
 
     Write-Host ""

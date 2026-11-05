@@ -32,6 +32,11 @@ import subprocess
 import time
 from pathlib import Path
 
+try:
+    from daemon import cc_wincred
+except ImportError:
+    import cc_wincred
+
 ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter"
 KEEPALIVE_DIR = ROOT / "keepalive"
 DEFAULT_MAX_DIR = Path.home() / ".claude-personal"
@@ -64,13 +69,39 @@ def read_creds(path: Path) -> tuple[str | None, float | None]:
     return (tok if isinstance(tok, str) and tok.strip() else None), exp_s
 
 
+def best_creds(cred_path: Path | None, config_dir: Path | None) -> tuple[str | None, float | None]:
+    """Freshest sign-in for one Claude Code login: its .credentials.json or, on
+    newer Claude Code, Windows Credential Manager (whichever expires later).
+
+    config_dir None = the default ~/.claude login.
+    """
+    f_tok, f_exp = read_creds(cred_path) if cred_path else (None, None)
+    c_tok, c_exp = cc_wincred.read(config_dir)
+    if c_tok and (not f_tok or (c_exp or 0) >= (f_exp or 0)):
+        return c_tok, c_exp
+    return f_tok, f_exp
+
+
+_auto_cache: tuple[float, bool] = (0.0, False)
+
+
+def _max_signed_in() -> bool:
+    """Is there a login for ~/.claude-personal (file or Credential Manager)? 60 s cache."""
+    global _auto_cache
+    if (DEFAULT_MAX_DIR / ".credentials.json").exists():
+        return True
+    if time.time() - _auto_cache[0] > 60:
+        _auto_cache = (time.time(), cc_wincred.has_login(DEFAULT_MAX_DIR))
+    return _auto_cache[1]
+
+
 def max_dir(cfg: dict) -> Path | None:
     """The Max account's Claude Code config folder, or None when not set up."""
     raw = str(cfg.get("max_config_dir") or "auto").strip()
     if raw.lower() in ("off", "no", "none", "0"):
         return None
     if raw.lower() == "auto":
-        return DEFAULT_MAX_DIR if (DEFAULT_MAX_DIR / ".credentials.json").exists() else None
+        return DEFAULT_MAX_DIR if _max_signed_in() else None
     return Path(os.path.expandvars(raw)).expanduser()
 
 
@@ -143,12 +174,14 @@ class TokenKeeper:
     def kick(self, label: str, cred_path: Path | None, config_dir: Path | None,
              cfg: dict, force: bool = False) -> None:
         """Start a renewal if the token is close to expiring (or `force`, after a 401)."""
-        if str(cfg.get("keepalive", "on")).lower() == "off" or cred_path is None:
+        if str(cfg.get("keepalive", "on")).lower() == "off":
             return
         t = self._tasks.get(label)
         if t and not t.done():
             return
-        _, exp = read_creds(cred_path)
+        tok, exp = best_creds(cred_path, config_dir)
+        if tok is None:
+            return
         now = time.time()
         due = force or (exp is not None and exp - now < REFRESH_AHEAD_S)
         if not due:
@@ -166,10 +199,10 @@ class TokenKeeper:
         self._tasks[label] = asyncio.ensure_future(
             self._renew(label, exe, cred_path, config_dir, exp))
 
-    async def _renew(self, label: str, exe: str, cred_path: Path,
+    async def _renew(self, label: str, exe: str, cred_path: Path | None,
                      config_dir: Path | None, old_exp: float | None) -> None:
         ok = await asyncio.to_thread(self._run, exe, config_dir)
-        _, exp = read_creds(cred_path)
+        _, exp = best_creds(cred_path, config_dir)
         renewed = exp is not None and (old_exp is None or exp > old_exp + 60) and exp > time.time() + REFRESH_AHEAD_S
         if renewed:
             self._fails[label] = 0

@@ -68,6 +68,10 @@ New modules next to `claude_usage_daemon_windows.py`:
 - `cc_spend.py`: prices Claude Code transcripts for the live spend and stats.
 - `cc_approval.py`, `cc_board.py`: approval files, config, message builders,
   optional Home Assistant webhook.
+- `cc_wincred.py`: reads Claude Code's sign-in from Windows Credential Manager,
+  where newer Claude Code keeps it instead of `.credentials.json`
+  (`Claude Code-credentials`, plus `-<8 hex>` for a CLAUDE_CONFIG_DIR login).
+  The daemon uses whichever of the file and Credential Manager expires later.
 - `cc_accounts.py`: the second (Max) account and the sign-in keep-alive. Claude
   Code tokens last a few hours and renew only when Claude Code runs, so a few
   minutes before one expires the daemon runs one tiny `claude -p` (Haiku, no
@@ -97,3 +101,6 @@ ha_webhook_url =             # http://homeassistant.local:8123/api/webhook/<id>
 3. Optional Max screen: `powershell -ExecutionPolicy Bypass -File tools\windows\connect-max.ps1`
    signs a second Claude Code login into `%USERPROFILE%\.claude-personal`.
 4. Optional Home Assistant: see `tools/windows/home-assistant-clawdmeter.yaml`.
+5. Start with Windows: `tools\windows\fix-autostart.ps1` checks the startup
+   entry, re-enables it if Windows switched it off, and adds a backup scheduled
+   task (sign-in + every 15 min; the tray app allows only one copy).

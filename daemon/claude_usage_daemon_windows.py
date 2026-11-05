@@ -491,8 +491,15 @@ class Session:
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            # Bounded: after the laptop sleeps, a WinRT write on a link that died
+            # underneath it can wait forever and freeze the whole loop. A timeout
+            # counts as a failed write -> zombie-link break -> clean reconnect.
+            await asyncio.wait_for(
+                self.client.write_gatt_char(RX_CHAR_UUID, data, response=False), timeout=10)
             return True
+        except asyncio.TimeoutError:
+            log("Write timed out (Bluetooth link stuck) - reconnecting")
+            return False
         except (BleakError, OSError) as e:
             # WinRT can raise a raw OSError/WinError (NOT wrapped as BleakError)
             # when the peer GATT server goes transiently unavailable mid-write —
@@ -564,9 +571,19 @@ def _windows_credential_candidates() -> list[Path]:
     ]
 
 
+def _primary_config_dir() -> Path | None:
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(cfg) if cfg else None
+
+
 def read_token() -> str | None:
-    """Read the Claude OAuth access token from the first available credential file."""
-    for path in _windows_credential_candidates():
+    """The freshest Claude Code access token: the credentials file or, on newer
+    Claude Code, Windows Credential Manager (whichever expires later)."""
+    path = next((p for p in _windows_credential_candidates() if p.exists()), None)
+    tok, _ = cc_accounts.best_creds(path, _primary_config_dir())
+    if tok:
+        return tok
+    for path in _windows_credential_candidates():   # older / unusual file shapes
         try:
             return _extract_access_token(path.read_text(encoding="utf-8"))
         except OSError:
@@ -581,6 +598,10 @@ def _read_expiry() -> str:
     Divides by 1000 before passing to fromtimestamp (Python expects seconds).
     Returns 'expiry unknown' on any parse failure.
     """
+    path = next((p for p in _windows_credential_candidates() if p.exists()), None)
+    _, exp = cc_accounts.best_creds(path, _primary_config_dir())
+    if exp:
+        return datetime.datetime.fromtimestamp(exp, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     for path in _windows_credential_candidates():
         try:
             raw = path.read_text(encoding="utf-8")
@@ -633,7 +654,7 @@ def primary_cred_path() -> Path | None:
 async def poll_max(mdir: Path, cfg: dict) -> dict | None:
     """Max-screen message for the second account; None = transient, try next poll."""
     cred = mdir / ".credentials.json"
-    tok, _ = cc_accounts.read_creds(cred)
+    tok, _ = cc_accounts.best_creds(cred, mdir)
     if not tok:
         return cc_accounts.max_message(None, 1)
     KEEPER.kick("Max", cred, mdir, cfg)
@@ -739,7 +760,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                 pending_refresh = False
                 last_attempt = now
                 cfg_now = cc_board.read_cfg()
-                KEEPER.kick("work", primary_cred_path(), None, cfg_now)
+                KEEPER.kick("work", primary_cred_path(), _primary_config_dir(), cfg_now)
                 token = read_token()  # D-09: fresh each cycle
                 if not token:
                     log("No token; skipping poll")
@@ -750,7 +771,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                         payload = await poll_api(token)
                     except AuthError:
                         # Real 401/403 — token genuinely needs a refresh.
-                        KEEPER.kick("work", primary_cred_path(), None, cfg_now, force=True)
+                        KEEPER.kick("work", primary_cred_path(), _primary_config_dir(), cfg_now, force=True)
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
                         payload = None

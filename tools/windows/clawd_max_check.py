@@ -17,7 +17,8 @@ from daemon import claude_usage_daemon_windows as d  # noqa: E402
 d.log = lambda m: None          # keep the check's own lines out of daemon.log
 
 folder = Path(sys.argv[1]) if len(sys.argv) > 1 else cc_accounts.DEFAULT_MAX_DIR
-tok, exp = cc_accounts.read_creds(folder / ".credentials.json")
+# the credentials file, or Windows Credential Manager on newer Claude Code
+tok, exp = cc_accounts.best_creds(folder / ".credentials.json", folder)
 if not tok:
     print(f"No sign-in found in {folder}")
     sys.exit(1)
