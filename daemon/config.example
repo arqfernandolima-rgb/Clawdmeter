@@ -15,6 +15,8 @@
 #     change is seen it shows the plan with the highest current usage.
 #   - Unset (default) = just ~/.claude, unchanged single-plan behavior.
 #   - install.sh can detect your ~/.claude* dirs and fill this in for you.
+#   - Windows too (config in %LOCALAPPDATA%\Clawdmeter\config): each dir's
+#     .credentials.json is read, e.g. config_dirs = ~/.claude, ~/.claude-personal
 # config_dirs = ~/.claude, ~/.claude-work
 
 # Play a sound on the device when your 5-hour session limit resets, so you know
@@ -30,3 +32,11 @@ chime = off
 #   12   = show the clock, forced 12-hour  (e.g. 6:28 PM)
 #   24   = show the clock, forced 24-hour  (e.g. 18:28)
 clock = off
+
+# Also send usage to an e-paper dashboard (optional). With config_dirs listing
+# both plans (e.g. ~/.claude for Max and ~/.claude-work for Enterprise), every
+# plan is sent each poll, not just the one shown on the device.
+# The Home Assistant "E-paper Dashboard" app shows both lines, with your token,
+# on its sidebar page.
+# dashboard_url = http://192.168.1.10:8090/claude
+# dashboard_token = paste-the-token-here

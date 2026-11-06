@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -475,6 +476,49 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     }
 
 
+def read_dashboard_settings() -> tuple[str, str]:
+    """`dashboard_url` / `dashboard_token` from the config file (both optional).
+
+    When set, each poll's usage is also sent to an e-paper dashboard, e.g. the
+    Home Assistant "E-paper Dashboard" app at http://<HA address>:8090/claude.
+    Best effort: a push failure is logged and never touches the BLE link.
+    """
+    url = token = ""
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip().lower()
+                if key == "dashboard_url":
+                    url = val.strip()
+                elif key == "dashboard_token":
+                    token = val.strip()
+    except OSError:
+        pass
+    return url, token
+
+
+async def push_dashboard(payloads: list[dict]) -> None:
+    """Send this cycle's usage (every polled plan) to the dashboard, if configured."""
+    url, token = read_dashboard_settings()
+    if not url or not payloads:
+        return
+    # device-only fields (chime, clock) aren't usage
+    plans = [{k: v for k, v in p.items() if k not in ("c", "t", "tf")} for p in payloads]
+    try:
+        # trust_env=False: talk to the LAN address directly, never via a corporate proxy
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as http:
+            resp = await http.post(url, json={"plans": plans, "host": socket.gethostname()},
+                                   headers={"X-Dashboard-Token": token})
+        if resp.status_code >= 400:
+            log(f"Dashboard push HTTP {resp.status_code}: {resp.text[:120]}")
+    except httpx.HTTPError as e:
+        log(f"Dashboard push failed: {e}")
+
+
 class PlanSelector:
     """Decide which config dir's plan is "active" across polls.
 
@@ -524,6 +568,7 @@ async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None
             sessions[d] = int(payload.get("s", 0) or 0)
     if not payloads:
         return None
+    await push_dashboard(list(payloads.values()))   # all plans, not just the active one
     active = selector.choose(sessions)
     if len(dirs) > 1:
         log(f"Active plan: {active} (s={sessions[active]})")

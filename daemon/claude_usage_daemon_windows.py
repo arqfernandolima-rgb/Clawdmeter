@@ -15,6 +15,7 @@ import logging.handlers
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -45,6 +46,23 @@ RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked r
 # Optional clock display. 
 # Config lives under the same Clawdmeter dir as daemon.log.
 CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter" / "config"
+
+
+def config_path() -> Path:
+    """The config file in use. Notepad saves a new file as "config.txt" unless told
+    otherwise (and Explorer hides the extension), so that name is accepted too."""
+    if CONFIG_FILE.exists():
+        return CONFIG_FILE
+    alt = CONFIG_FILE.with_name(CONFIG_FILE.name + ".txt")
+    return alt if alt.exists() else CONFIG_FILE
+
+
+def _config_text() -> str:
+    """Config file text, tolerant of Notepad's UTF-8 BOM; "" when there is none."""
+    try:
+        return config_path().read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -118,16 +136,15 @@ def read_chime_setting() -> str:
     Defaults to "off" so the device stays silent until the user opts in.
     """
     try:
-        if CONFIG_FILE.exists():
-            for line in CONFIG_FILE.read_text().splitlines():
-                line = line.split("#", 1)[0].strip()
-                if "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                if key.strip().lower() == "chime":
-                    val = val.strip().lower()
-                    if val in ("off", "on"):
-                        return val
+        for line in _config_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            if key.strip().lower() == "chime":
+                val = val.strip().lower()
+                if val in ("off", "on"):
+                    return val
     except OSError:
         pass
     return "off"
@@ -139,16 +156,15 @@ def read_clock_setting() -> str:
     Defaults to "off" so existing setups keep showing "Usage" until opted in.
     """
     try:
-        if CONFIG_FILE.exists():
-            for line in CONFIG_FILE.read_text().splitlines():
-                line = line.split("#", 1)[0].strip()
-                if "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                if key.strip().lower() == "clock":
-                    val = val.strip().lower()
-                    if val in ("off", "auto", "12", "24"):
-                        return val
+        for line in _config_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            if key.strip().lower() == "clock":
+                val = val.strip().lower()
+                if val in ("off", "auto", "12", "24"):
+                    return val
     except OSError:
         pass
     return "off"
@@ -247,6 +263,67 @@ async def poll_api(token: str) -> dict | None:
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
+
+
+def read_dashboard_settings() -> tuple[str, str]:
+    """`dashboard_url` / `dashboard_token` from the config file (both optional).
+
+    When set, each poll's usage is also sent to an e-paper dashboard, e.g. the
+    Home Assistant "E-paper Dashboard" app at http://<HA address>:8090/claude.
+    Best effort: a push failure is logged and never touches the BLE link.
+    """
+    url = token = ""
+    try:
+        for line in _config_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip().lower()
+            if key == "dashboard_url":
+                url = val.strip().strip("\"'")
+            elif key == "dashboard_token":
+                token = val.strip().strip("\"'")
+    except OSError:
+        pass
+    return url, token
+
+
+async def push_dashboard(payloads: list[dict]) -> None:
+    """Send this cycle's usage (every polled plan) to the dashboard, if configured."""
+    url, token = read_dashboard_settings()
+    if not url:
+        _dashboard_status(f"Dashboard: off (no dashboard_url in {config_path()})")
+        return
+    if not payloads:
+        return
+    # device-only fields (chime, clock) aren't usage
+    plans = [{k: v for k, v in p.items() if k not in ("c", "t", "tf")} for p in payloads]
+    try:
+        # trust_env=False: talk to the LAN address directly, never via a corporate proxy
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as http:
+            resp = await http.post(url, json={"plans": plans, "host": socket.gethostname()},
+                                   headers={"X-Dashboard-Token": token})
+        if resp.status_code >= 400:
+            hint = " (check dashboard_token)" if resp.status_code == 403 else ""
+            _dashboard_status(f"Dashboard push to {url}: HTTP {resp.status_code}{hint} {resp.text[:120]}", always=True)
+        else:
+            _dashboard_status(f"Dashboard: sending {len(plans)} plan(s) to {url}")
+    except httpx.HTTPError as e:
+        _dashboard_status(f"Dashboard push to {url} failed: {type(e).__name__} {e}"
+                          " (is this computer on the same network as Home Assistant?)", always=True)
+
+
+_last_dashboard_status = ""
+
+
+def _dashboard_status(msg: str, always: bool = False) -> None:
+    """Log the dashboard state when it changes (failures every time), so daemon.log
+    always says whether pushes work without a line every minute."""
+    global _last_dashboard_status
+    if always or msg != _last_dashboard_status:
+        log(msg)
+    _last_dashboard_status = msg
 
 
 def _billing_period_info(now: float, reset_ts: str) -> dict:
@@ -478,6 +555,103 @@ def read_token() -> str | None:
     return None
 
 
+def read_config_dirs() -> list[Path] | None:
+    """Claude config dirs to poll, from the `config_dirs` option (comma list, ~ expanded).
+
+    None when the option isn't set: the single-plan lookup above (env overrides, then the
+    candidate list) is used exactly as before. Mirrors the macOS/Linux daemon, e.g.
+    ``config_dirs = ~/.claude, ~/.claude-personal`` for an Enterprise + a Max login.
+    """
+    raw = ""
+    try:
+        for line in _config_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            if key.strip().lower() == "config_dirs":
+                raw = val.strip()
+    except OSError:
+        pass
+    dirs = [Path(p.strip()).expanduser() for p in raw.split(",") if p.strip()]
+    return dirs or None
+
+
+def read_token_for(config_dir: Path) -> str | None:
+    """OAuth token for one config dir: Claude Code keeps it in <dir>/.credentials.json on Windows."""
+    try:
+        return _extract_access_token((config_dir / ".credentials.json").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+class PlanSelector:
+    """Decide which config dir's plan the Clawdmeter shows.
+
+    "Active" = the plan whose session % rose most recently. A rise stamps a poll counter,
+    so the choice is sticky and a window reset (a drop to 0) isn't mistaken for use.
+    Before any rise (startup) the highest session % wins. Same rule as the macOS daemon.
+    """
+
+    def __init__(self) -> None:
+        self.prev_s: dict = {}
+        self.last_active: dict = {}
+        self.seq = 0
+
+    def choose(self, sessions: dict):
+        self.seq += 1
+        for d, s in sessions.items():
+            if d in self.prev_s and s > self.prev_s[d]:
+                self.last_active[d] = self.seq
+            self.prev_s[d] = s
+        return max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+
+
+# Module-level so the active-plan state survives reconnects.
+_SELECTOR = PlanSelector()
+
+
+async def poll_active_payload(tray_state=None, selector: PlanSelector = _SELECTOR) -> dict | None:
+    """Poll every configured plan, push them all to the dashboard (if set up), and return
+    the active plan's payload for the Clawdmeter. None = nothing usable this cycle.
+
+    Without `config_dirs` this is the old single poll: read_token() -> poll_api().
+    """
+    dirs = read_config_dirs()
+    sources = [(d, read_token_for(d)) for d in dirs] if dirs else [(None, read_token())]
+    payloads: dict = {}
+    sessions: dict = {}
+    auth_failed = False
+    missing = 0
+    for d, token in sources:
+        if not token:
+            missing += 1
+            log("No token; skipping poll" if d is None else f"No token in {d}; skipping")
+            continue
+        try:
+            payload = await poll_api(token)
+        except AuthError:
+            # Real 401/403 — that login genuinely needs a refresh.
+            auth_failed = True
+            if d is not None:
+                log(f"Token rejected for {d}; run claude login for that profile")
+            continue
+        if payload is not None:
+            payloads[d] = payload
+            sessions[d] = int(payload.get("s", 0) or 0)
+    if not payloads:
+        if tray_state and (auth_failed or missing == len(sources)):
+            tray_state.set_error("token expired — run claude login")
+        # else: TRANSIENT failure (network/DNS, timeout, rate-limit, 5xx). poll_api
+        # already logged it; leave the tray state alone and retry next tick.
+        return None
+    await push_dashboard(list(payloads.values()))   # all plans, not just the active one
+    active = selector.choose(sessions)
+    if len(sources) > 1:
+        log(f"Active plan: {active} (s={sessions[active]})")
+    return payloads[active]
+
+
 def _read_expiry() -> str:
     """Return human-readable expiry from the first-hit credentials file.
 
@@ -595,39 +769,28 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()  # D-09: fresh each cycle
-                if not token:
-                    log("No token; skipping poll")
-                    if tray_state:
-                        tray_state.set_error("token expired — run claude login")
-                else:
-                    try:
-                        payload = await poll_api(token)
-                    except AuthError:
-                        # Real 401/403 — token genuinely needs a refresh.
+                # D-09: tokens are read fresh each cycle, one per configured plan
+                payload = await poll_active_payload(tray_state)
+                if payload is not None:
+                    if await session.write_payload(payload):
+                        last_poll = time.time()
+                        used_successfully = True
+                        consecutive_failures = 0  # D-03: reset on success
                         if tray_state:
-                            tray_state.set_error("token expired — run claude login")
-                        payload = None
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
-                            consecutive_failures = 0  # D-03: reset on success
-                            if tray_state:
-                                tray_state.set_connected(time.time())
-                        else:
-                            consecutive_failures += 1
-                            if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
-                                log(
-                                    f"Zombie link detected ({consecutive_failures} consecutive"
-                                    f" write failures); abandoning connection"
-                                )
-                                break
-                    # else: payload is None from a TRANSIENT failure (network/DNS,
-                    # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
-                    # toast "token expired" — that mislabeled a boot-time DNS blip
-                    # as an auth problem (SC#5). Leave tray state unchanged; the next
-                    # tick retries and set_connected() recovers it.
+                            tray_state.set_connected(time.time())
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
+                            log(
+                                f"Zombie link detected ({consecutive_failures} consecutive"
+                                f" write failures); abandoning connection"
+                            )
+                            break
+                # else: payload is None from a TRANSIENT failure (network/DNS,
+                # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
+                # toast "token expired" — that mislabeled a boot-time DNS blip
+                # as an auth problem (SC#5). Leave tray state unchanged; the next
+                # tick retries and set_connected() recovers it.
 
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run
