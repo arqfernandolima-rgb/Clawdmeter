@@ -168,3 +168,42 @@ def test_dashboard_log_says_what_happened(tmp_path, monkeypatch):
         _run(mod.push_dashboard([{"s": 1}]))
         _run(mod.push_dashboard([{"s": 1}]))
     assert "HTTP 403 (check dashboard_token)" in logs[-1] and len(logs) == 4   # failures every time
+
+
+# ---------------------------------------------------------------------------
+# dashboard keeps getting usage while the Clawdmeter is disconnected
+# ---------------------------------------------------------------------------
+
+def _offline_run(monkeypatch, tmp_path, url, last_poll_age):
+    cfg = tmp_path / "config"
+    cfg.write_text(f"dashboard_url = {url}\n" if url else "chime = on\n")
+    monkeypatch.setattr(mod, "CONFIG_FILE", cfg)
+    monkeypatch.setattr(mod, "POLL_INTERVAL", 0.05)
+    poll = AsyncMock(return_value=None)
+    monkeypatch.setattr(mod, "poll_active_payload", poll)
+
+    async def go():
+        mod._last_poll_at = mod.time.time() - last_poll_age
+        stop = asyncio.Event()
+        task = asyncio.create_task(mod.dashboard_while_offline(stop))
+        await asyncio.sleep(0.08)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+    _run(go())
+    return poll
+
+
+def test_offline_device_still_feeds_dashboard(tmp_path, monkeypatch):
+    poll = _offline_run(monkeypatch, tmp_path, "http://h:8090/claude", last_poll_age=60)
+    poll.assert_awaited()
+    assert poll.await_args.args == (None,)                 # no tray state touched
+
+
+def test_no_extra_polls_while_connected(tmp_path, monkeypatch):
+    poll = _offline_run(monkeypatch, tmp_path, "http://h:8090/claude", last_poll_age=0)
+    poll.assert_not_awaited()
+
+
+def test_no_dashboard_no_offline_polls(tmp_path, monkeypatch):
+    poll = _offline_run(monkeypatch, tmp_path, "", last_poll_age=60)
+    poll.assert_not_awaited()

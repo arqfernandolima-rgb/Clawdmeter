@@ -609,6 +609,26 @@ class PlanSelector:
 
 # Module-level so the active-plan state survives reconnects.
 _SELECTOR = PlanSelector()
+_last_poll_at = 0.0          # when poll_active_payload last ran (BLE session or dashboard loop)
+
+
+async def dashboard_while_offline(stop_event: asyncio.Event) -> None:
+    """Keep the dashboard fed while the Clawdmeter isn't connected (off, out of range,
+    or stuck). The BLE session polls every POLL_INTERVAL while connected; this only
+    polls when nothing has for 1.5x that, so a connected device costs no extra calls.
+    Nothing here touches BLE or the tray state."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
+            return
+        except asyncio.TimeoutError:
+            pass
+        url, _ = read_dashboard_settings()
+        if url and time.time() - _last_poll_at > POLL_INTERVAL * 1.5:
+            try:
+                await poll_active_payload(None)       # pushes every plan; the result isn't shown anywhere
+            except Exception as e:                    # never let this loop die
+                log(f"Dashboard poll failed: {type(e).__name__} {e}")
 
 
 async def poll_active_payload(tray_state=None, selector: PlanSelector = _SELECTOR) -> dict | None:
@@ -617,6 +637,8 @@ async def poll_active_payload(tray_state=None, selector: PlanSelector = _SELECTO
 
     Without `config_dirs` this is the old single poll: read_token() -> poll_api().
     """
+    global _last_poll_at
+    _last_poll_at = time.time()
     dirs = read_config_dirs()
     sources = [(d, read_token_for(d)) for d in dirs] if dirs else [(None, read_token())]
     payloads: dict = {}
@@ -860,6 +882,8 @@ async def main(tray_state=None) -> None:
     # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
     reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
+    # The dashboard (if set up) keeps getting usage even while the device is away.
+    dash_task = asyncio.create_task(dashboard_while_offline(stop_event))
     while not stop_event.is_set():
         device = await acquire_target()
         if not device:
@@ -889,6 +913,7 @@ async def main(tray_state=None) -> None:
             # Successful session — reset reconnect counter to floor; search_backoff also reset
             reconnect_backoff = 1
             search_backoff = 1
+    dash_task.cancel()
 
 
 if __name__ == "__main__":
