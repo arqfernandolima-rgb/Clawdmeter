@@ -15,6 +15,7 @@ import logging.handlers
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -319,6 +320,75 @@ async def poll_api(token: str) -> dict | None:
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
+
+
+# ---------------------------------------------------------------- e-paper dashboard push
+# Optional: also send each account's usage to the Home Assistant "E-paper Dashboard"
+# app (dashboard_url / dashboard_token in the config; the app's page shows both lines).
+# Best effort: failures are logged, the BLE link is never affected.
+
+def config_path() -> Path:
+    """The config file in use. Notepad saves a new file as "config.txt" unless told
+    otherwise (and Explorer hides the extension), so that name is accepted too."""
+    if CONFIG_FILE.exists():
+        return CONFIG_FILE
+    alt = CONFIG_FILE.with_name(CONFIG_FILE.name + ".txt")
+    return alt if alt.exists() else CONFIG_FILE
+
+
+def read_dashboard_settings() -> tuple[str, str]:
+    """`dashboard_url` / `dashboard_token` (both optional); tolerant of a UTF-8 BOM and quotes."""
+    url = token = ""
+    try:
+        text = config_path().read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return url, token
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip().lower(), val.strip().strip("\"'")
+        if key == "dashboard_url":
+            url = val
+        elif key == "dashboard_token":
+            token = val
+    return url, token
+
+
+_last_dashboard_status = ""
+
+
+def _dashboard_status(msg: str, always: bool = False) -> None:
+    """Log the dashboard state when it changes (failures every time)."""
+    global _last_dashboard_status
+    if always or msg != _last_dashboard_status:
+        log(msg)
+    _last_dashboard_status = msg
+
+
+async def push_dashboard(payloads: list[dict]) -> None:
+    """Send usage payloads (each tagged "acct": "pro" or "ent") to the dashboard, if set up."""
+    url, token = read_dashboard_settings()
+    if not url or not payloads:
+        return
+    keep = ("s", "sr", "w", "wr", "st", "tp", "pd", "rd", "acct")
+    plans = [{k: p[k] for k in keep if k in p} for p in payloads]
+    kinds = "+".join(sorted(str(p.get("acct", "?")) for p in plans))
+    try:
+        # trust_env=False: talk to the LAN address directly, never via a corporate proxy
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as http:
+            resp = await http.post(url, json={"plans": plans, "host": socket.gethostname()},
+                                   headers={"X-Dashboard-Token": token})
+        if resp.status_code >= 400:
+            hint = " (check dashboard_token)" if resp.status_code == 403 else ""
+            _dashboard_status(f"Dashboard push to {url}: HTTP {resp.status_code}{hint} {resp.text[:120]}",
+                              always=True)
+        else:
+            _dashboard_status(f"Dashboard: sending {kinds} to {url}")
+    except httpx.HTTPError as e:
+        _dashboard_status(f"Dashboard push to {url} failed: {type(e).__name__} {e}"
+                          " (is this computer on the same network as Home Assistant?)", always=True)
 
 
 def _billing_period_info(now: float, reset_ts: str) -> dict:
@@ -651,6 +721,49 @@ def primary_cred_path() -> Path | None:
     return None
 
 
+_last_poll_at = 0.0   # when the work account was last polled (BLE session or dashboard loop)
+
+
+def mark_polled() -> None:
+    global _last_poll_at
+    _last_poll_at = time.time()
+
+
+async def dashboard_while_offline(stop_event: asyncio.Event) -> None:
+    """Keep the dashboard fed while the Clawdmeter isn't connected (off, out of range,
+    or stuck). The BLE session polls every POLL_INTERVAL while connected; this only
+    polls when nothing has for 1.5x that, so a connected board costs no extra calls.
+    Nothing here touches BLE or the tray."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
+            return
+        except asyncio.TimeoutError:
+            pass
+        url, _ = read_dashboard_settings()
+        if not url or time.time() - _last_poll_at <= POLL_INTERVAL * 1.5:
+            continue
+        mark_polled()
+        try:
+            cfg = cc_board.read_cfg()
+            KEEPER.kick("work", primary_cred_path(), _primary_config_dir(), cfg)
+            token = read_token()
+            payload = None
+            if token:
+                try:
+                    payload = await poll_api(token)
+                except AuthError:
+                    KEEPER.kick("work", primary_cred_path(), _primary_config_dir(), cfg, force=True)
+            if payload is not None:
+                add_spend_fields(payload)
+                await push_dashboard([payload])
+            mdir = cc_accounts.max_dir(cfg)
+            if mdir is not None:
+                await poll_max(mdir, cfg)            # pushes the Max account itself
+        except Exception as e:                       # never let this loop die
+            log(f"Dashboard poll failed: {type(e).__name__} {e}")
+
+
 async def poll_max(mdir: Path, cfg: dict) -> dict | None:
     """Max-screen message for the second account; None = transient, try next poll."""
     cred = mdir / ".credentials.json"
@@ -660,6 +773,8 @@ async def poll_max(mdir: Path, cfg: dict) -> dict | None:
     KEEPER.kick("Max", cred, mdir, cfg)
     try:
         payload = await poll_api(tok)
+        if payload is not None:
+            await push_dashboard([payload])
     except AuthError:
         KEEPER.kick("Max", cred, mdir, cfg, force=True)
         # one 401 right at expiry is normal: the keep-alive is already renewing
@@ -759,6 +874,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
             if (pending_refresh or elapsed >= POLL_INTERVAL) and now - last_attempt >= RETRY_MIN_S:
                 pending_refresh = False
                 last_attempt = now
+                mark_polled()
                 cfg_now = cc_board.read_cfg()
                 KEEPER.kick("work", primary_cred_path(), _primary_config_dir(), cfg_now)
                 token = read_token()  # D-09: fresh each cycle
@@ -777,6 +893,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                         payload = None
                     if payload is not None:
                         add_spend_fields(payload)
+                        await push_dashboard([payload])
                         cc_board.add_usage_extras(payload, cc_board.read_cfg())
                         last_payload = dict(payload)
                         if await session.write_payload(payload):
@@ -931,6 +1048,7 @@ async def main(tray_state=None) -> None:
 
     # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
+    dash_task = asyncio.create_task(dashboard_while_offline(stop_event))   # dashboard keeps going without the board
     reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
     while not stop_event.is_set():
         device = await acquire_target()
@@ -961,6 +1079,7 @@ async def main(tray_state=None) -> None:
             # Successful session — reset reconnect counter to floor; search_backoff also reset
             reconnect_backoff = 1
             search_backoff = 1
+    dash_task.cancel()
 
 
 if __name__ == "__main__":

@@ -30,3 +30,10 @@ chime = off
 #   12   = show the clock, forced 12-hour  (e.g. 6:28 PM)
 #   24   = show the clock, forced 24-hour  (e.g. 18:28)
 clock = off
+
+# Also send usage to an e-paper dashboard (optional). Both accounts (the main
+# Claude Code login and the Max one) are sent each poll, and keep being sent
+# while the board is disconnected. The Home Assistant "E-paper Dashboard" app
+# shows both lines, with your token, on its page.
+# dashboard_url = http://192.168.1.10:8090/claude
+# dashboard_token = paste-the-token-here
